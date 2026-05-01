@@ -285,16 +285,15 @@ class NLBBooker:
         target = datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
         log.info(f"  设置 Date = {target.strftime('%d %b %Y')}")
 
-        # Date 字段打开的是日历组件，不是 div.my-2 下拉列表，
-        # 不能用 _open_popup()（它会等 div.my-2 可见，从而超时）。
+        # Date 打开的是日历组件，不含 div.my-2，不能用 _open_popup()
         trigger = self.page.locator('.inputPopupSelectDiv').filter(has_text="Date").first
         await trigger.wait_for(state="visible", timeout=10_000)
         await trigger.click()
-        # 等日历本体出现（Vuetify date-picker 或通用 calendar 容器）
+        # 等日历本体出现（任意一个 Vuetify 日期选择器特征元素）
         await self.page.wait_for_selector(
             '.v-date-picker-header, [class*="datepicker"], '
             '[class*="calendar"], [class*="picker-title"], '
-            'button.v-btn[aria-label]',   # 日历里的日期按钮
+            'button.v-btn[aria-label]',
             timeout=10_000,
         )
         await asyncio.sleep(0.3)
@@ -336,22 +335,29 @@ class NLBBooker:
         return target
 
     async def _go_to_month(self, target: datetime, max_clicks: int = 14):
-        want = target.strftime("%B %Y")
+        want = target.strftime("%B %Y")   # e.g. "May 2026"
         for _ in range(max_clicks):
             header = self.page.locator(
                 '.v-date-picker-header__value, [class*="picker-title"], '
                 '[class*="calendar-header"], [class*="monthYear"]'
             ).first
             try:
-                cur = (await header.inner_text()).strip()
+                # 去掉换行/多余空格后再比较，避免格式差异导致匹配失败
+                cur = " ".join((await header.inner_text()).split())
             except Exception:
                 break
+            log.info(f"  📅 日历当前月份: {cur!r}，目标: {want!r}")
             if want in cur:
                 break
             nxt = self.page.locator(
                 'button[aria-label*="next" i], '
                 'button:has-text("›"), button:has-text(">")'
             ).last
+            # 如果 next 按钮已 disabled，说明不能再往后翻了，停止
+            disabled = await nxt.get_attribute("disabled")
+            if disabled is not None:
+                log.warning(f"  ⚠ Next month 按钮已禁用，停在: {cur!r}")
+                break
             await nxt.click()
             await asyncio.sleep(0.3)
 
