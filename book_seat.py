@@ -67,59 +67,72 @@ class NLBBooker:
     # ── 登录 ──────────────────────────────────────────────────────────────
     async def login(self):
         """
-        NLB 使用 CAS OAuth2 登录，实际落地页是：
-          https://signin.nlb.gov.sg/authenticate/login?service=...
-        表单字段：name="username" / name="password"
-        登录成功后会 302 回 nlb.gov.sg/seatbooking/
+        正确登录流程：
+          1. 打开座位预约主页
+          2. 点击底部 "Account" Tab → 跳转到 CAS 登录页
+          3. 填写账号密码并提交
+          4. 等待跳回 nlb.gov.sg，确认已登录
         """
-        log.info("▶ 登录（CAS OAuth）...")
-        # 访问预约主页，让它自动跳转到 CAS 登录页
+        log.info("▶ 打开主页...")
         await self.page.goto(BASE_URL, wait_until="networkidle")
-        await self.snap("01_login_page")
+        await self.snap("01_home")
 
-        # 等待 CAS 登录表单（signin.nlb.gov.sg）
-        await self.page.wait_for_selector(
-            'input[name="username"], input[name="userId"], input[type="text"]',
-            timeout=20_000
-        )
-        log.info(f"  登录页 URL: {self.page.url}")
-
-        # 填用户名（CAS 标准字段名 username；同时兼容 userId）
-        await self.page.fill(
-            'input[name="username"], input[name="userId"], '
-            'input[placeholder*="ID" i], input[type="text"]',
-            NLB_USERNAME
-        )
-        await self.page.fill('input[name="password"], input[type="password"]',
-                             NLB_PASSWORD)
-        await self.snap("02_creds")
-
-        # 提交（CAS 表单通常是 input[type=submit] 或 button[type=submit]）
-        submit = self.page.locator(
-            'input[type="submit"], button[type="submit"], '
-            'button:has-text("Login"), button:has-text("Log in"), '
-            'button:has-text("Sign in")'
+        # 步骤 1：点击底部导航 "Account" Tab
+        log.info("▶ 点击 Account Tab...")
+        account_tab = self.page.locator(
+            '.v-btn__content:has-text("Account"), '
+            'span:has-text("Account"), '
+            'button:has-text("Account")'
         ).first
-        await submit.wait_for(state="visible", timeout=10_000)
-        await submit.click()
-
-        # 等待 OAuth 回调完成，页面回到 nlb.gov.sg
-        try:
-            await self.page.wait_for_url(
-                "**/nlb.gov.sg/seatbooking**", timeout=30_000
-            )
-        except PlaywrightTimeout:
-            pass  # 有时 wait_for_url 不准确，继续判断
+        await account_tab.wait_for(state="visible", timeout=15_000)
+        await account_tab.click()
         await self.page.wait_for_load_state("networkidle")
-        await self.snap("03_after_login")
+        await self.snap("02_account_tab")
+        log.info(f"  Account 页 URL: {self.page.url}")
 
-        current = self.page.url
-        log.info(f"  登录后 URL: {current}")
-        # 失败条件：还在 signin.nlb.gov.sg（表示没有跳回来）
-        if "signin.nlb.gov.sg" in current:
-            raise RuntimeError(
-                f"登录失败！仍在登录页，请检查账号密码或截图 02_creds.png。URL={current}"
+        # 步骤 2：如果跳转到 CAS 登录页，填写账密
+        if "signin.nlb.gov.sg" in self.page.url or "login" in self.page.url.lower():
+            log.info("▶ 检测到登录页，填写账号密码...")
+            await self.page.wait_for_selector(
+                'input[name="username"], input[name="userId"], input[type="text"]',
+                timeout=20_000
             )
+            await self.page.fill(
+                'input[name="username"], input[name="userId"], '
+                'input[placeholder*="ID" i], input[type="text"]',
+                NLB_USERNAME
+            )
+            await self.page.fill(
+                'input[name="password"], input[type="password"]',
+                NLB_PASSWORD
+            )
+            await self.snap("03_creds_filled")
+
+            submit = self.page.locator(
+                'input[type="submit"], button[type="submit"], '
+                'button:has-text("Login"), button:has-text("Log in"), '
+                'button:has-text("Sign in")'
+            ).first
+            await submit.wait_for(state="visible", timeout=10_000)
+            await submit.click()
+
+            # 等待 OAuth 回调，页面跳回 nlb.gov.sg
+            try:
+                await self.page.wait_for_url("**/nlb.gov.sg/**", timeout=30_000)
+            except PlaywrightTimeout:
+                pass
+            await self.page.wait_for_load_state("networkidle")
+            await self.snap("04_after_submit")
+            log.info(f"  提交后 URL: {self.page.url}")
+
+        # 步骤 3：确认已登录（不再停在 signin 页）
+        if "signin.nlb.gov.sg" in self.page.url:
+            raise RuntimeError(
+                f"登录失败！请检查账号密码和截图 03_creds_filled.png。URL={self.page.url}"
+            )
+
+        # 步骤 4：确认 Account 页显示已登录状态（有用户名 / logout 按钮等）
+        await self.snap("05_logged_in_account")
         log.info("✅ 登录成功")
 
     # ── 打开 New Booking 页 ───────────────────────────────────────────────
