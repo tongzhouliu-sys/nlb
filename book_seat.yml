@@ -1,0 +1,56 @@
+name: NLB Seat Auto-Booking
+
+on:
+  # 每天 12:00 SGT (= 04:00 UTC) 自动触发
+  schedule:
+    - cron: "0 4 * * *"
+
+  # 也可在 Actions 页面手动触发（方便测试）
+  workflow_dispatch:
+    inputs:
+      date_offset:
+        description: "预约哪天（0=今天, 1=明天, 默认1）"
+        required: false
+        default: "1"
+
+jobs:
+  book-seat:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 1. 拉取代码 ───────────────────────────────────────────────
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. 配置 Python ────────────────────────────────────────────
+      - name: 🐍 Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      # ── 3. 安装依赖 ───────────────────────────────────────────────
+      - name: 📦 Install dependencies
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
+
+      # ── 4. 执行预约脚本 ───────────────────────────────────────────
+      - name: 🪑 Run booking script
+        env:
+          NLB_USERNAME: ${{ secrets.NLB_USERNAME }}
+          NLB_PASSWORD: ${{ secrets.NLB_PASSWORD }}
+          BOOKING_DATE_OFFSET: ${{ github.event.inputs.date_offset || '1' }}
+        run: python book_seat.py
+
+      # ── 5. 上传截图（失败时也上传，便于排查） ─────────────────────
+      - name: 📸 Upload screenshots (debug)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: booking-screenshots-${{ github.run_id }}
+          path: screenshots/
+          retention-days: 7
+          if-no-files-found: ignore
