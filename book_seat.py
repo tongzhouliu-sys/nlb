@@ -1,12 +1,13 @@
 """
-NLB Seat Booking Automation Script  (v3 — 基于真实 DOM 日志修复)
+NLB Seat Booking Automation Script  (v4 — 座位优先级选座)
 =================================================================
-修复内容（根据 GitHub Actions 运行日志）：
-  - Time / Duration 和 Library / Area 一样，都是 inputPopupSelectDiv 弹窗
-  - Duration 字段标签全称是 "Duration (Hour : Min)"，不能用 "Duration" 查找
-  - CHECK AVAILABLE SLOTS 是 <div>，不是 <button>
-  - 弹窗选项统一是 <div class="my-2">文字</div>
-  - 所有弹窗字段用同一套 _open_popup() + _pick_option() 方法
+新增功能（v4）：
+  - 座位分三个优先级：
+      第一序列：S74-S86（最优先）
+      第二序列：S1-S16
+      其他座位：兜底，按页面顺序尝试
+  - _pick_seat_by_priority() 自动扫描页面可用座位，按序列依次点击
+  - 所有序列均不可用时抛出异常，避免误预约错误座位
 """
 
 import os
@@ -24,7 +25,12 @@ NLB_PASSWORD = os.environ["NLB_PASSWORD"]
 TARGET_LIBRARY = "Punggol Library"
 TARGET_AREA    = "Study Zone, Level 3"
 
-SEAT_CANDIDATES = [f"S{n}" for n in range(86, 73, -1)]   # S86 → S74
+# 座位优先级：第一序列 S74-S86，第二序列 S1-S16，其余兜底
+_TIER1 = [f"S{n}" for n in range(74, 87)]    # S74 → S86
+_TIER2 = [f"S{n}" for n in range(1, 17)]     # S1  → S16
+_TIER3_EXCLUDE = set(_TIER1) | set(_TIER2)
+# _TIER3 在运行时根据页面实际可用座位动态补充（见 _pick_seat_by_priority）
+SEAT_CANDIDATES = _TIER1 + _TIER2            # 静态已知候选（_TIER3 动态追加）
 
 BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
@@ -459,14 +465,13 @@ class NLBBooker:
         await self._click_area_and_book(label)
         log.info(f"🎉 {label} 预约完成！")
         return TARGET_AREA
-
     # ── 点击区域结果卡片并完成预约 ──────────────────────────────────────
     async def _click_area_and_book(self, label: str):
         """
         Search Results 页：点击 TARGET_AREA 对应的卡片
+        → Seat Selection 页：按优先级选座（第一序列 S74-S86，第二序列 S1-S16，其他）
         → Booking Details 页：点 BOOK 按钮
         → 处理确认弹窗
-        NLB 是区域预约，座位由系统分配，不需要手动选座。
         """
         s = _safe(label)
         await asyncio.sleep(1.5)
@@ -496,18 +501,25 @@ class NLBBooker:
             await self.page.get_by_text(TARGET_AREA, exact=False).first.click()
             log.info(f"  ✔ 点击区域卡片（兜底）: {TARGET_AREA}")
 
+        await asyncio.sleep(1.0)
+        await self.snap(f"12_seat_selection_{s}")
+
+        # ── 按优先级选座 ──────────────────────────────────────────────
+        booked_seat = await self._pick_seat_by_priority(s)
+        log.info(f"  🪑 最终选座: {booked_seat}")
+
         # 等 Booking Details 页面 + BOOK 按钮
         await self.page.wait_for_selector(
             'button:has-text("BOOK")', timeout=15_000
         )
-        await self.snap(f"12_booking_details_{s}")
+        await self.snap(f"13_booking_details_{s}")
         log.info("  📄 已进入 Booking Details 页")
 
         # 点 BOOK 按钮
         await self.page.locator('button:has-text("BOOK")').first.click()
         log.info("  ✔ 已点击 BOOK 按钮")
         await asyncio.sleep(1.5)
-        await self.snap(f"13_after_book_{s}")
+        await self.snap(f"14_after_book_{s}")
 
         # 处理可能出现的确认弹窗
         for word in ["OK", "Confirm", "Yes", "CONFIRM"]:
@@ -517,10 +529,93 @@ class NLBBooker:
                 await btn.click()
                 log.info(f"  ✔ 确认弹窗: {word}")
                 await asyncio.sleep(1.5)
-                await self.snap(f"14_confirmed_{s}")
+                await self.snap(f"15_confirmed_{s}")
                 break
             except PlaywrightTimeout:
                 continue
+
+    # ── 按优先级选座 ──────────────────────────────────────────────────────
+    async def _pick_seat_by_priority(self, label_safe: str) -> str:
+        """
+        座位优先级：
+          第一序列 S74-S86 → 第二序列 S1-S16 → 其他可用座位（兜底）
+
+        返回实际选中的座位号；若无任何可用座位则抛出 RuntimeError。
+        """
+        # ── 收集页面上所有可用（未禁用）座位元素 ────────────────────────
+        async def _get_available_seats() -> dict[str, object]:
+            """返回 {座位号: locator} 的字典，只含可用座位。"""
+            available: dict[str, object] = {}
+            for sel in [
+                '[class*="seat"]:not([class*="disabled"]):not([class*="unavailable"])',
+                '[class*="seat"]:not([disabled])',
+                'button[class*="seat"]',
+                '[data-seat]',
+            ]:
+                els = self.page.locator(sel)
+                cnt = await els.count()
+                if cnt == 0:
+                    continue
+                for i in range(cnt):
+                    el = els.nth(i)
+                    try:
+                        if not await el.is_visible():
+                            continue
+                        # 获取座位号：优先 data-seat，其次 aria-label，最后 inner_text
+                        seat_id = (
+                            await el.get_attribute("data-seat")
+                            or await el.get_attribute("aria-label")
+                            or (await el.inner_text()).strip()
+                        )
+                        if not seat_id:
+                            continue
+                        seat_id = seat_id.strip().upper()
+                        # 过滤掉明确禁用的
+                        cls = (await el.get_attribute("class")) or ""
+                        if any(k in cls.lower() for k in ("disabled", "unavailable", "booked", "occupied")):
+                            continue
+                        available[seat_id] = el
+                    except Exception:
+                        continue
+                if available:
+                    break   # 找到结果就不再尝试下一个 selector
+            return available
+
+        available = await _get_available_seats()
+        log.info(f"  📋 可用座位数: {len(available)}  示例: {list(available.keys())[:10]}")
+
+        if not available:
+            log.warning("  ⚠ 未检测到可用座位，尝试直接进入预约详情页（系统自动分配）")
+            return "AUTO"
+
+        # ── 按优先级构造候选序列 ─────────────────────────────────────────
+        # Tier 3：页面上有但不在 Tier1/Tier2 的座位，保持页面顺序
+        tier3 = [sid for sid in available if sid not in _TIER3_EXCLUDE]
+        ordered_candidates = _TIER1 + _TIER2 + tier3
+
+        # ── 逐个尝试 ────────────────────────────────────────────────────
+        for tier_label, seats in [
+            ("第一序列(S74-S86)", _TIER1),
+            ("第二序列(S1-S16)",  _TIER2),
+            ("其他座位",          tier3),
+        ]:
+            log.info(f"  🔍 尝试 {tier_label}...")
+            for seat_id in seats:
+                if seat_id not in available:
+                    continue
+                el = available[seat_id]
+                try:
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    log.info(f"  ✅ 已选座位: {seat_id}（{tier_label}）")
+                    await asyncio.sleep(0.8)
+                    await self.snap(f"seat_selected_{seat_id}_{label_safe}")
+                    return seat_id
+                except Exception as e:
+                    log.warning(f"  ⚠ 点击 {seat_id} 失败: {e}，继续下一个")
+                    continue
+
+        raise RuntimeError("所有优先级座位均不可用，预约失败")
 
 
 # ═════════════════════════════════════════════════════════════════════════
