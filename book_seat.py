@@ -74,7 +74,8 @@ class NLBBooker:
           4. 等待跳回 nlb.gov.sg，确认已登录
         """
         log.info("▶ 打开主页...")
-        await self.page.goto(BASE_URL, wait_until="networkidle")
+        await self.page.goto(BASE_URL, wait_until="load")
+        await asyncio.sleep(2)   # SPA 初始化缓冲
         await self.snap("01_home")
 
         # 步骤 1：点击底部导航 "Account" Tab
@@ -86,7 +87,11 @@ class NLBBooker:
         ).first
         await account_tab.wait_for(state="visible", timeout=15_000)
         await account_tab.click()
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            await self.page.wait_for_load_state("load", timeout=20_000)
+        except PlaywrightTimeout:
+            pass
+        await asyncio.sleep(1)
         await self.snap("02_account_tab")
         log.info(f"  Account 页 URL: {self.page.url}")
 
@@ -116,12 +121,22 @@ class NLBBooker:
             await submit.wait_for(state="visible", timeout=10_000)
             await submit.click()
 
-            # 等待 OAuth 回调，页面跳回 nlb.gov.sg
+            # 等待 OAuth 多级跳转完成：URL 离开 signin.nlb.gov.sg 即可
+            # 不用 networkidle —— SPA 页面永远有后台 XHR，networkidle 会超时
             try:
-                await self.page.wait_for_url("**/nlb.gov.sg/**", timeout=30_000)
+                await self.page.wait_for_function(
+                    "() => !window.location.hostname.includes('signin.nlb.gov.sg')",
+                    timeout=60_000,
+                )
+            except PlaywrightTimeout:
+                log.warning("  ⚠ 60s 内 URL 未离开 signin 页，继续尝试...")
+
+            # 再等页面基本加载完（用 load，不用 networkidle）
+            try:
+                await self.page.wait_for_load_state("load", timeout=30_000)
             except PlaywrightTimeout:
                 pass
-            await self.page.wait_for_load_state("networkidle")
+            await asyncio.sleep(2)  # SPA 路由渲染缓冲
             await self.snap("04_after_submit")
             log.info(f"  提交后 URL: {self.page.url}")
 
@@ -138,11 +153,15 @@ class NLBBooker:
     # ── 打开 New Booking 页 ───────────────────────────────────────────────
     async def navigate_to_new_booking(self):
         log.info("▶ 打开新建预约页...")
-        await self.page.goto(BASE_URL, wait_until="networkidle")
+        await self.page.goto(BASE_URL, wait_until="load")
+        await asyncio.sleep(2)
         # 点底部导航 "New" Tab
         try:
             await self.page.locator('.v-btn__content:has-text("New")').first.click()
-            await self.page.wait_for_load_state("networkidle")
+            try:
+                await self.page.wait_for_load_state("load", timeout=20_000)
+            except PlaywrightTimeout:
+                pass
         except PlaywrightTimeout:
             pass
         # 等 inputPopupSelectDiv 表单主体出现
@@ -303,7 +322,10 @@ class NLBBooker:
         ).first
         await btn.wait_for(state="visible", timeout=10_000)
         await btn.click()
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            await self.page.wait_for_load_state("load", timeout=20_000)
+        except PlaywrightTimeout:
+            pass
         await asyncio.sleep(1.5)
         await self.snap("11_slots")
 
@@ -386,7 +408,10 @@ class NLBBooker:
             state="visible", timeout=10_000
         )
         await self.page.locator(confirm_sel).first.click()
-        await self.page.wait_for_load_state("networkidle")
+        try:
+            await self.page.wait_for_load_state("load", timeout=20_000)
+        except PlaywrightTimeout:
+            pass
         await self.snap(f"13_confirm1_{s}")
 
         for word in ["OK", "Confirm", "Yes"]:
@@ -394,7 +419,10 @@ class NLBBooker:
                 btn = self.page.get_by_text(word, exact=True).first
                 await btn.wait_for(state="visible", timeout=4_000)
                 await btn.click()
-                await self.page.wait_for_load_state("networkidle")
+                try:
+                    await self.page.wait_for_load_state("load", timeout=20_000)
+                except PlaywrightTimeout:
+                    pass
                 await self.snap(f"14_confirm2_{s}")
                 break
             except PlaywrightTimeout:
