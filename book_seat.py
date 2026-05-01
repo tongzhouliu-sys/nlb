@@ -151,20 +151,78 @@ class NLBBooker:
     # ── Library / Area 字段（点击后弹出选项列表） ────────────────────────
     async def _pick_field(self, label: str, value: str):
         log.info(f"  选 {label} = {value}")
-        # 点击字段行（包含 label 文字的父容器）
+
+        # 点击字段行
         row = self.page.locator(f'text="{label}"').locator('..')
         await row.click()
-        await asyncio.sleep(0.8)
+        await asyncio.sleep(1.2)
         await self.snap(f"05_picker_{label.lower()}_open")
 
-        # 选项：role=option 或 li 文字匹配
-        option = self.page.get_by_role("option", name=value).or_(
-            self.page.locator(f'li:has-text("{value}"), [class*="item"]:has-text("{value}")')
-        ).first
-        await option.wait_for(state="visible", timeout=10_000)
-        await option.click()
-        await asyncio.sleep(0.5)
-        log.info(f"  ✔ {label} 已选")
+        # ── 打印当前所有可见文字元素（调试用） ──────────────────────
+        visible_texts = await self.page.evaluate("""() => {
+            const tags = ['li','div','span','p','label','option',
+                          '[class*="item"]','[class*="option"]','[class*="list"]'];
+            const seen = new Set();
+            const results = [];
+            document.querySelectorAll(tags.join(',')).forEach(el => {
+                const txt = el.innerText?.trim();
+                if (txt && txt.length < 80 && !seen.has(txt)) {
+                    seen.add(txt);
+                    results.push({tag: el.tagName, cls: el.className.slice(0,60), txt});
+                }
+            });
+            return results.slice(0, 60);
+        }""")
+        log.info(f"  ── 点开后可见元素（供调试）──")
+        for el in visible_texts:
+            log.info(f"    <{el['tag']}> cls={el['cls']!r}  →  {el['txt']!r}")
+        log.info(f"  ── END ──")
+
+        # ── 策略 1: role=option ───────────────────────────────────────
+        opt1 = self.page.get_by_role("option", name=value)
+        if await opt1.count() > 0:
+            await opt1.first.click()
+            log.info(f"  ✔ {label} 已选（role=option）")
+            await asyncio.sleep(0.5)
+            return
+
+        # ── 策略 2: Vuetify v-list-item（常见结构） ──────────────────
+        vuetify_selectors = [
+            f'.v-list-item:has-text("{value}")',
+            f'.v-list-item__title:has-text("{value}")',
+            f'[class*="list-item"]:has-text("{value}")',
+            f'[class*="v-list"]:has-text("{value}")',
+        ]
+        for sel in vuetify_selectors:
+            els = self.page.locator(sel)
+            if await els.count() > 0:
+                await els.first.click()
+                log.info(f"  ✔ {label} 已选（{sel}）")
+                await asyncio.sleep(0.5)
+                return
+
+        # ── 策略 3: 精确文字匹配所有可见元素 ─────────────────────────
+        for tag in ["li", "div", "span", "p", "label"]:
+            els = self.page.locator(tag)
+            cnt = await els.count()
+            for i in range(cnt):
+                try:
+                    txt = (await els.nth(i).inner_text()).strip()
+                    if txt == value:
+                        visible = await els.nth(i).is_visible()
+                        if visible:
+                            await els.nth(i).click()
+                            log.info(f"  ✔ {label} 已选（<{tag}> 文字精确匹配）")
+                            await asyncio.sleep(0.5)
+                            return
+                except Exception:
+                    continue
+
+        await self.snap(f"ERR_picker_{label.lower()}_no_option")
+        raise RuntimeError(
+            f"找不到 {label} 的选项 {value!r}。\n"
+            f"请查看截图 05_picker_{label.lower()}_open.png 和日志中的可见元素列表。"
+        )
 
     # ── Date 字段 ─────────────────────────────────────────────────────────
     async def _set_date(self, booking_date: datetime):
