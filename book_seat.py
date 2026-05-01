@@ -200,28 +200,33 @@ class NLBBooker:
     async def _open_popup(self, field_label: str):
         """
         点击包含 field_label 文字的 .inputPopupSelectDiv 打开弹窗。
-        等弹出内容（div.my-2:visible 选项列表）出现后返回。
-        页面上可能存在大量隐藏的 div.my-2，必须等可见的那一批出现。
+        等弹出内容（div.my-2 选项列表）出现后返回。
         """
         trigger = self.page.locator('.inputPopupSelectDiv').filter(
             has_text=field_label
         ).first
         await trigger.wait_for(state="visible", timeout=10_000)
         await trigger.click()
-        # 用 :visible 伪类过滤，忽略页面上大量已存在的隐藏 div.my-2
         await self.page.wait_for_selector('div.my-2:visible', timeout=10_000)
         await asyncio.sleep(0.3)
 
     async def _pick_option(self, option_text: str, exact: bool = True):
         """
         在已打开的弹窗里，从 div.my-2:visible 列表中选择 option_text。
-        exact=True 时要求内容完全相等；False 时只要包含即可。
+        exact=True  : 内容完全相等
+        exact=False : 使用词边界正则，避免 "2:00 pm" 误匹配 "12:00 pm"
         """
+        import re as _re
         items = self.page.locator('div.my-2:visible')
         cnt = await items.count()
         for i in range(cnt):
             txt = (await items.nth(i).inner_text()).strip()
-            match = (txt == option_text) if exact else (option_text.lower() in txt.lower())
+            if exact:
+                match = (txt == option_text)
+            else:
+                # \b 词边界防止 "2:00" 匹配 "12:00"
+                pat = r'(?<![\d])' + _re.escape(option_text.strip())
+                match = bool(_re.search(pat, txt, _re.IGNORECASE))
             if match:
                 await items.nth(i).click()
                 log.info(f"  ✔ 已选: {txt}")
@@ -344,19 +349,16 @@ class NLBBooker:
                 '[class*="calendar-header"], [class*="monthYear"]'
             ).first
             try:
-                # 规范化空白，避免换行/多空格干扰
                 cur = " ".join((await header.inner_text()).split())
             except Exception:
                 break
             log.info(f"  📅 日历当前: {cur!r}  目标月份: {month_name} {year_str}")
-            # 月份名和年份分别检查，不依赖固定顺序
             if month_name in cur and year_str in cur:
                 break
             nxt = self.page.locator(
                 'button[aria-label*="next" i], '
                 'button:has-text("›"), button:has-text(">")'
             ).last
-            # next 按钮 disabled 时不再尝试点击
             disabled = await nxt.get_attribute("disabled")
             if disabled is not None:
                 log.warning(f"  ⚠ Next month 按钮已禁用，停在: {cur!r}")
@@ -386,7 +388,7 @@ class NLBBooker:
         ).first
         await trigger.wait_for(state="visible", timeout=10_000)
         await trigger.click()
-        await self.page.wait_for_selector('div.my-2', timeout=10_000)
+        await self.page.wait_for_selector('div.my-2:visible', timeout=10_000)
         await asyncio.sleep(0.3)
         await self.snap("10_dur_popup")
         await self._pick_option(dur_str, exact=False)
