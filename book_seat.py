@@ -1,13 +1,16 @@
 """
-NLB Seat Booking Automation Script  (v4 — 座位优先级选座)
-=================================================================
-新增功能（v4）：
-  - 座位分三个优先级：
-      第一序列：S74-S86（最优先）
-      第二序列：S1-S16
-      其他座位：兜底，按页面顺序尝试
-  - _pick_seat_by_priority() 自动扫描页面可用座位，按序列依次点击
-  - 所有序列均不可用时抛出异常，避免误预约错误座位
+NLB Seat Booking Automation Script  (v5 — Preferred Seat 弹窗 + Duration 多候选)
+=================================================================================
+v5 新增修复：
+  1. 【核心修复】处理点击 BOOK 后弹出的 "Preferred Seat" 对话框：
+       - 之前：程序直接点 CONFIRM，保持默认 "No preferred seat"（系统随机分配）
+       - 现在：弹窗出现后，先往下滚动按优先级（S74-S86 → S1-S16 → 其他）选具体座位，
+               再点 CONFIRM，确保预约到目标座位
+  2. 【时间修复】Duration 改为候选列表，自动探测弹窗实际文字格式：
+       - 候选顺序：["1 hour 30 mins", "1:30", "90 mins", "1.5 hours", "1 hr 30 min"]
+       - 弹窗会先打印所有选项便于调试，逐一尝试直到匹配成功
+       - 全部候选均失败时，兜底选第一个非空选项并记录日志
+  3. 新增截图节点：14b（弹窗出现）、14c（弹窗已选座位）
 """
 
 import os
@@ -35,9 +38,10 @@ SEAT_CANDIDATES = _TIER1 + _TIER2            # 静态已知候选（_TIER3 动�
 BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
+# Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
 TIME_SLOTS = [
-    ("10:00–11:30", "10:00 am", "1:30"),
-    ("14:00–15:30", "2:00 pm",  "1:30"),
+    ("10:00–11:30", "10:00 am", ["1 hour 30 mins", "1:30", "90 mins", "1.5 hours", "1 hr 30 min"]),
+    ("14:00–15:30", "2:00 pm",  ["1 hour 30 mins", "1:30", "90 mins", "1.5 hours", "1 hr 30 min"]),
 ]
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
@@ -429,9 +433,16 @@ class NLBBooker:
         log.info("  ✅ Time 已选")
 
     # ── 选时长（Radio 对话框）─────────────────────────────────────────────
-    async def select_duration(self, dur_str: str):
-        """dur_str: "1:30" 等，与 Duration 对话框文字完全一致"""
-        log.info(f"  设置 Duration = {dur_str}")
+    async def select_duration(self, dur_candidates):
+        """
+        dur_candidates: str 或 list[str]
+        NLB 的 Duration 选项文字格式可能因版本变化，
+        传入候选列表，逐一尝试，首个匹配成功即返回。
+        """
+        if isinstance(dur_candidates, str):
+            dur_candidates = [dur_candidates]
+
+        log.info(f"  设置 Duration，候选: {dur_candidates}")
         trigger = self.page.locator('.inputPopupSelectDiv').filter(
             has_text="Duration"
         ).first
@@ -439,8 +450,34 @@ class NLBBooker:
         await trigger.click()
         await asyncio.sleep(0.8)
         await self.snap("10_dur_popup")
-        await self._pick_dialog_radio(dur_str)
-        log.info("  ✅ Duration 已选")
+
+        # 先记录弹窗所有选项，便于调试
+        items = self.page.locator('div.my-2')
+        cnt = await items.count()
+        all_opts = []
+        for i in range(cnt):
+            try:
+                all_opts.append((await items.nth(i).inner_text()).strip())
+            except Exception:
+                pass
+        log.info(f"  Duration 弹窗选项: {all_opts}")
+
+        for dur_str in dur_candidates:
+            try:
+                await self._pick_dialog_radio(dur_str)
+                log.info(f"  ✅ Duration 已选: {dur_str}")
+                return
+            except RuntimeError:
+                log.warning(f"  ⚠ Duration 候选 {dur_str!r} 未找到，尝试下一个")
+                continue
+
+        # 兜底：选第一个非空选项
+        log.warning("  ⚠ 所有 Duration 候选均未匹配，选择第一个可用选项作为兜底")
+        if all_opts:
+            await self._pick_dialog_radio(all_opts[0])
+            log.info(f"  ✅ Duration 兜底选择: {all_opts[0]}")
+        else:
+            raise RuntimeError(f"Duration 弹窗无可用选项，候选: {dur_candidates}")
 
     # ── CHECK AVAILABLE SLOTS ─────────────────────────────────────────────
     async def check_available_slots(self):
@@ -458,7 +495,7 @@ class NLBBooker:
         await self.snap("11_slots")
 
     # ── 完整预约一个时段 ──────────────────────────────────────────────────
-    async def book_one_slot(self, label: str, time_str: str, dur_str: str):
+    async def book_one_slot(self, label: str, time_str: str, dur_candidates):
         log.info(f"\n{'='*60}")
         log.info(f"▶ 预约时段: {label}")
 
@@ -467,7 +504,7 @@ class NLBBooker:
         await self.select_area()
         await self.select_date()
         await self.select_time(time_str)
-        await self.select_duration(dur_str)
+        await self.select_duration(dur_candidates)
         await self.check_available_slots()
 
         await self._click_area_and_book(label)
@@ -529,7 +566,144 @@ class NLBBooker:
         await asyncio.sleep(1.5)
         await self.snap(f"14_after_book_{s}")
 
-        # 处理可能出现的确认弹窗
+        # ── 处理 "Preferred Seat" 弹窗 ────────────────────────────────────
+        # 点击 BOOK 后会弹出 "Preferred Seat" 对话框，
+        # 默认选中 "No preferred seat"（系统分配），
+        # 需要往下滚动选择具体座位，然后点 CONFIRM
+        await self._handle_preferred_seat_dialog(s)
+
+    # ── 处理 "Preferred Seat" 弹窗 ──────────────────────────────────────────
+    async def _handle_preferred_seat_dialog(self, label_safe: str):
+        """
+        点击 BOOK 后出现的 "Preferred Seat" 弹窗处理：
+          - 弹窗默认选中 "No preferred seat"（系统分配）
+          - 需要往下滚动，按优先级选择具体座位（S74-S86 → S1-S16 → 其他）
+          - 选好后点 CONFIRM 确认
+
+        若弹窗未出现（某些时段直接跳过），则检查是否已有其他确认弹窗。
+        """
+        # 等待 "Preferred Seat" 弹窗出现
+        try:
+            await self.page.wait_for_selector(
+                'text="Preferred Seat"', timeout=6_000
+            )
+            log.info("  📋 检测到 Preferred Seat 弹窗")
+        except PlaywrightTimeout:
+            log.info("  ℹ Preferred Seat 弹窗未出现，检查其他确认弹窗...")
+            await self._click_confirm_dialog(label_safe)
+            return
+
+        await self.snap(f"14b_preferred_seat_dialog_{label_safe}")
+
+        # 弹窗内的座位列表：收集所有可点击的座位选项（跳过 "No preferred seat"）
+        # 选项通常是 radio label 或 div.my-2 格式，文字形如 "S74", "S1" 等
+        preferred_seat = await self._pick_preferred_seat_in_dialog()
+        log.info(f"  🪑 Preferred Seat 弹窗选座: {preferred_seat}")
+
+        await self.snap(f"14c_preferred_seat_selected_{label_safe}")
+
+        # 点 CONFIRM 确认
+        confirm_btn = None
+        for sel in [
+            'button:has-text("CONFIRM")',
+            'button:has-text("Confirm")',
+            '[role="button"]:has-text("CONFIRM")',
+        ]:
+            try:
+                btn = self.page.locator(sel).first
+                if await btn.count() > 0:
+                    await btn.wait_for(state="visible", timeout=5_000)
+                    confirm_btn = btn
+                    break
+            except Exception:
+                continue
+
+        if confirm_btn:
+            await confirm_btn.click()
+            log.info("  ✔ Preferred Seat 弹窗：已点击 CONFIRM")
+        else:
+            # 兜底：文字匹配
+            await self.page.get_by_text("CONFIRM", exact=True).first.click()
+            log.info("  ✔ Preferred Seat 弹窗：已点击 CONFIRM（兜底）")
+
+        await asyncio.sleep(1.5)
+        await self.snap(f"15_confirmed_{label_safe}")
+
+    async def _pick_preferred_seat_in_dialog(self) -> str:
+        """
+        在 Preferred Seat 弹窗内，按优先级选择座位：
+          第一序列 S74-S86 → 第二序列 S1-S16 → 其他可选座位
+
+        弹窗内每个选项通常是一个 radio/label，文字即座位号（如 "S74"）。
+        "No preferred seat" 是第一项（系统分配），跳过它，往下找具体座位。
+        返回实际选中的座位号；若无可用座位，保持 "No preferred seat" 默认并返回 "AUTO"。
+        """
+        await asyncio.sleep(0.5)  # 等弹窗内容完全渲染
+
+        # 收集弹窗内所有选项（含座位号）
+        available_in_dialog: dict[str, object] = {}
+
+        # 策略1：radio/label 选项
+        for sel in [
+            '.v-dialog label',
+            '.v-dialog [role="radio"]',
+            '.v-dialog .v-radio',
+            '.v-dialog div.my-2',
+            # 通用对话框选择器
+            '[role="dialog"] label',
+            '[role="dialog"] div.my-2',
+        ]:
+            els = self.page.locator(sel)
+            cnt = await els.count()
+            if cnt == 0:
+                continue
+            log.info(f"  🔎 Preferred Seat 弹窗选择器 {sel!r} 匹配 {cnt} 项")
+            for i in range(cnt):
+                el = els.nth(i)
+                try:
+                    txt = (await el.inner_text()).strip()
+                    if not txt or txt.lower() in ("no preferred seat", ""):
+                        continue
+                    # 座位号通常是 "S数字" 格式
+                    seat_key = txt.upper().replace(" ", "")
+                    available_in_dialog[seat_key] = el
+                except Exception:
+                    continue
+            if available_in_dialog:
+                log.info(f"  📋 Preferred Seat 弹窗可选座位: {sorted(available_in_dialog.keys())}")
+                break
+
+        if not available_in_dialog:
+            log.warning("  ⚠ Preferred Seat 弹窗未找到具体座位选项，保持 'No preferred seat'")
+            return "AUTO"
+
+        # 按优先级选座
+        tier3 = [sid for sid in available_in_dialog if sid not in _TIER3_EXCLUDE]
+        for tier_label, seats in [
+            ("第一序列(S74-S86)", _TIER1),
+            ("第二序列(S1-S16)",  _TIER2),
+            ("其他座位",          tier3),
+        ]:
+            candidates = [s for s in seats if s in available_in_dialog]
+            log.info(f"  🔍 弹窗尝试 {tier_label}，候选: {candidates}")
+            for seat_id in candidates:
+                el = available_in_dialog[seat_id]
+                try:
+                    await el.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.3)
+                    await el.click()
+                    log.info(f"  ✅ Preferred Seat 弹窗已选: {seat_id}（{tier_label}）")
+                    await asyncio.sleep(0.5)
+                    return seat_id
+                except Exception as e:
+                    log.warning(f"  ⚠ 弹窗点击 {seat_id} 失败: {e}")
+                    continue
+
+        log.warning("  ⚠ Preferred Seat 弹窗所有优先级座位均不可用，保持默认")
+        return "AUTO"
+
+    async def _click_confirm_dialog(self, label_safe: str):
+        """处理普通确认弹窗（OK / Confirm / Yes / CONFIRM）"""
         for word in ["OK", "Confirm", "Yes", "CONFIRM"]:
             try:
                 btn = self.page.get_by_text(word, exact=True).first
@@ -537,7 +711,7 @@ class NLBBooker:
                 await btn.click()
                 log.info(f"  ✔ 确认弹窗: {word}")
                 await asyncio.sleep(1.5)
-                await self.snap(f"15_confirmed_{s}")
+                await self.snap(f"15_confirmed_{label_safe}")
                 break
             except PlaywrightTimeout:
                 continue
