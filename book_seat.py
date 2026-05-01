@@ -207,26 +207,19 @@ class NLBBooker:
         ).first
         await trigger.wait_for(state="visible", timeout=10_000)
         await trigger.click()
-        await self.page.wait_for_selector('div.my-2:visible', timeout=10_000)
+        await self.page.wait_for_selector('div.my-2', timeout=10_000)
         await asyncio.sleep(0.3)
 
     async def _pick_option(self, option_text: str, exact: bool = True):
         """
-        在已打开的弹窗里，从 div.my-2:visible 列表中选择 option_text。
-        exact=True  : 内容完全相等
-        exact=False : 使用词边界正则，避免 "2:00 pm" 误匹配 "12:00 pm"
+        在已打开的弹窗里，从 div.my-2 列表中选择 option_text。
+        exact=True 时要求内容完全相等；False 时只要包含即可。
         """
-        import re as _re
-        items = self.page.locator('div.my-2:visible')
+        items = self.page.locator('div.my-2')
         cnt = await items.count()
         for i in range(cnt):
             txt = (await items.nth(i).inner_text()).strip()
-            if exact:
-                match = (txt == option_text)
-            else:
-                # \b 词边界防止 "2:00" 匹配 "12:00"
-                pat = r'(?<![\d])' + _re.escape(option_text.strip())
-                match = bool(_re.search(pat, txt, _re.IGNORECASE))
+            match = (txt == option_text) if exact else (option_text.lower() in txt.lower())
             if match:
                 await items.nth(i).click()
                 log.info(f"  ✔ 已选: {txt}")
@@ -292,14 +285,13 @@ class NLBBooker:
         target = datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
         log.info(f"  设置 Date = {target.strftime('%d %b %Y')}")
 
-        # Date 打开的是日历组件，不含 div.my-2，不能用 _open_popup()
+        # Date 打开日历对话框，不是 div.my-2 下拉，不能用 _open_popup()
         trigger = self.page.locator('.inputPopupSelectDiv').filter(has_text="Date").first
         await trigger.wait_for(state="visible", timeout=10_000)
         await trigger.click()
         await self.page.wait_for_selector(
             '.v-date-picker-header, [class*="datepicker"], '
-            '[class*="calendar"], [class*="picker-title"], '
-            'button.v-btn[aria-label]',
+            '[class*="calendar"], button.v-btn[aria-label]',
             timeout=10_000,
         )
         await asyncio.sleep(0.3)
@@ -352,7 +344,7 @@ class NLBBooker:
                 cur = " ".join((await header.inner_text()).split())
             except Exception:
                 break
-            log.info(f"  📅 日历当前: {cur!r}  目标月份: {month_name} {year_str}")
+            log.info(f"  📅 日历当前: {cur!r}  目标: {month_name} {year_str}")
             if month_name in cur and year_str in cur:
                 break
             nxt = self.page.locator(
@@ -361,37 +353,79 @@ class NLBBooker:
             ).last
             disabled = await nxt.get_attribute("disabled")
             if disabled is not None:
-                log.warning(f"  ⚠ Next month 按钮已禁用，停在: {cur!r}")
+                log.warning(f"  ⚠ Next month 已禁用，停在: {cur!r}")
                 break
             await nxt.click()
             await asyncio.sleep(0.3)
 
-    # ── 选时间（弹窗） ────────────────────────────────────────────────────
+    # ── 通用 Radio 对话框选项点击 ────────────────────────────────────────
+    async def _pick_dialog_radio(self, option_text: str):
+        """
+        在已打开的 Radio 对话框中点击匹配文字的选项。
+        Time / Duration / Area 对话框均用此方法。
+        采用精确完整文字匹配，避免 "2:00 pm" 误中 "12:00 pm"。
+        """
+        # 策略1：label 精确匹配（Vuetify radio label）
+        for sel in [
+            f'label:has-text("{option_text}")',
+            f'.v-radio:has-text("{option_text}")',
+            f'[role="radio"]:has-text("{option_text}")',
+            f'.v-list-item:has-text("{option_text}")',
+        ]:
+            try:
+                el = self.page.locator(sel).first
+                if await el.count() > 0:
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    log.info(f"  ✔ 已选: {option_text}（{sel}）")
+                    await asyncio.sleep(0.5)
+                    return
+            except Exception:
+                continue
+
+        # 策略2：遍历 div.my-2，逐一检查可见性 + 精确文字
+        items = self.page.locator('div.my-2')
+        cnt = await items.count()
+        for i in range(cnt):
+            el = items.nth(i)
+            try:
+                if not await el.is_visible():
+                    continue
+                txt = (await el.inner_text()).strip()
+                if txt == option_text:
+                    await el.click()
+                    log.info(f"  ✔ 已选(div.my-2): {txt}")
+                    await asyncio.sleep(0.5)
+                    return
+            except Exception:
+                continue
+
+        raise RuntimeError(f"Radio 对话框找不到选项: {option_text!r}")
+
+    # ── 选时间（Radio 对话框）─────────────────────────────────────────────
     async def select_time(self, time_str: str):
-        """time_str: "10:00 am" 或 "2:00 pm"（弹窗 div.my-2 里的文字）"""
+        """time_str: "10:00 am" / "2:00 pm" 等，与对话框文字完全一致"""
         log.info(f"  设置 Time = {time_str}")
-        await self._open_popup("Time")
+        trigger = self.page.locator('.inputPopupSelectDiv').filter(has_text="Time").first
+        await trigger.wait_for(state="visible", timeout=10_000)
+        await trigger.click()
+        await asyncio.sleep(0.8)
         await self.snap("09_time_popup")
-        await self._pick_option(time_str, exact=False)
+        await self._pick_dialog_radio(time_str)
         log.info("  ✅ Time 已选")
 
-    # ── 选时长（弹窗） ────────────────────────────────────────────────────
+    # ── 选时长（Radio 对话框）─────────────────────────────────────────────
     async def select_duration(self, dur_str: str):
-        """
-        dur_str: "1:30"（弹窗 div.my-2 里的文字，可能是 "1:30" 或 "1 hr 30 min"）
-        字段标签全称 "Duration (Hour : Min)"，用 "Duration" 做 has_text 模糊匹配即可。
-        """
+        """dur_str: "1:30" 等，与 Duration 对话框文字完全一致"""
         log.info(f"  设置 Duration = {dur_str}")
-        # 用 "Duration" 模糊匹配（contains），避免全称匹配失败
         trigger = self.page.locator('.inputPopupSelectDiv').filter(
             has_text="Duration"
         ).first
         await trigger.wait_for(state="visible", timeout=10_000)
         await trigger.click()
-        await self.page.wait_for_selector('div.my-2:visible', timeout=10_000)
-        await asyncio.sleep(0.3)
+        await asyncio.sleep(0.8)
         await self.snap("10_dur_popup")
-        await self._pick_option(dur_str, exact=False)
+        await self._pick_dialog_radio(dur_str)
         log.info("  ✅ Duration 已选")
 
     # ── CHECK AVAILABLE SLOTS ─────────────────────────────────────────────
@@ -422,82 +456,68 @@ class NLBBooker:
         await self.select_duration(dur_str)
         await self.check_available_slots()
 
-        seat = await self._pick_best_seat(label)
-        await self.snap(f"12_seat_{_safe(label)}")
-        log.info(f"✅ 座位 {seat} 已选")
+        await self._click_area_and_book(label)
+        log.info(f"🎉 {label} 预约完成！")
+        return TARGET_AREA
 
-        await self._confirm(label)
-        log.info(f"🎉 {label} 预约成功！座位: {seat}")
-        return seat
-
-    # ── 按优先级选座 ──────────────────────────────────────────────────────
-    async def _pick_best_seat(self, slot_label: str) -> str:
+    # ── 点击区域结果卡片并完成预约 ──────────────────────────────────────
+    async def _click_area_and_book(self, label: str):
+        """
+        Search Results 页：点击 TARGET_AREA 对应的卡片
+        → Booking Details 页：点 BOOK 按钮
+        → 处理确认弹窗
+        NLB 是区域预约，座位由系统分配，不需要手动选座。
+        """
+        s = _safe(label)
         await asyncio.sleep(1.5)
+        await self.snap(f"11_slots_{s}")
 
-        for seat in SEAT_CANDIDATES:
-            log.info(f"  🔍 {seat}...")
-
-            by_attr = self.page.locator(
-                f'[data-seat="{seat}"], [id="{seat}"], '
-                f'[aria-label="{seat}"], [title="{seat}"]'
-            )
-            by_text = self.page.locator(
-                'td, button, span, div[class*="seat"], div[class*="slot"]'
-            ).filter(has_text=seat)
-
-            candidate = None
-            if await by_attr.count() > 0:
-                candidate = by_attr.first
-            else:
-                cnt = await by_text.count()
-                for i in range(cnt):
-                    if (await by_text.nth(i).inner_text()).strip() == seat:
-                        candidate = by_text.nth(i)
-                        break
-
-            if candidate is None:
-                log.warning(f"    ⚠ {seat} 页面找不到，跳过")
+        # 找并点击 TARGET_AREA 结果卡片
+        clicked = False
+        for sel in [
+            f'.v-list-item:has-text("{TARGET_AREA}")',
+            f'li:has-text("{TARGET_AREA}")',
+            f'div[class*="item"]:has-text("{TARGET_AREA}")',
+            f'div[class*="card"]:has-text("{TARGET_AREA}")',
+        ]:
+            try:
+                el = self.page.locator(sel).first
+                if await el.count() > 0:
+                    await el.scroll_into_view_if_needed()
+                    await el.click()
+                    log.info(f"  ✔ 点击区域卡片: {TARGET_AREA}（{sel}）")
+                    clicked = True
+                    break
+            except Exception:
                 continue
 
-            cls      = (await candidate.get_attribute("class")) or ""
-            disabled = await candidate.get_attribute("disabled")
-            aria_dis = await candidate.get_attribute("aria-disabled")
-            bad      = {"disabled", "booked", "unavailable", "occupied",
-                        "reserved", "taken", "grey", "gray"}
-            if disabled is not None or aria_dis == "true" or any(c in cls.lower() for c in bad):
-                log.info(f"    ✗ {seat} 不可用")
-                continue
+        if not clicked:
+            log.warning("  ⚠ 精确选择器未命中，尝试文字兜底")
+            await self.page.get_by_text(TARGET_AREA, exact=False).first.click()
+            log.info(f"  ✔ 点击区域卡片（兜底）: {TARGET_AREA}")
 
-            await candidate.scroll_into_view_if_needed()
-            await candidate.click()
-            log.info(f"    ✔ {seat} 已选中！")
-            return seat
-
-        await self.snap(f"ERR_noseat_{_safe(slot_label)}")
-        raise RuntimeError(f"S74–S86 全部不可用！时段: {slot_label}")
-
-    # ── 提交确认 ──────────────────────────────────────────────────────────
-    async def _confirm(self, slot_label: str):
-        s = _safe(slot_label)
-        confirm_sel = (
-            'button:has-text("Book"), button:has-text("Confirm"), '
-            'button:has-text("BOOK"), button:has-text("Reserve"), '
-            'button[type="submit"]'
+        # 等 Booking Details 页面 + BOOK 按钮
+        await self.page.wait_for_selector(
+            'button:has-text("BOOK")', timeout=15_000
         )
-        await self.page.locator(confirm_sel).first.wait_for(
-            state="visible", timeout=10_000
-        )
-        await self.page.locator(confirm_sel).first.click()
-        await self.page.wait_for_load_state("load", timeout=20_000)
-        await self.snap(f"13_confirm1_{s}")
+        await self.snap(f"12_booking_details_{s}")
+        log.info("  📄 已进入 Booking Details 页")
 
-        for word in ["OK", "Confirm", "Yes"]:
+        # 点 BOOK 按钮
+        await self.page.locator('button:has-text("BOOK")').first.click()
+        log.info("  ✔ 已点击 BOOK 按钮")
+        await asyncio.sleep(1.5)
+        await self.snap(f"13_after_book_{s}")
+
+        # 处理可能出现的确认弹窗
+        for word in ["OK", "Confirm", "Yes", "CONFIRM"]:
             try:
                 btn = self.page.get_by_text(word, exact=True).first
                 await btn.wait_for(state="visible", timeout=4_000)
                 await btn.click()
-                await self.page.wait_for_load_state("load", timeout=20_000)
-                await self.snap(f"14_confirm2_{s}")
+                log.info(f"  ✔ 确认弹窗: {word}")
+                await asyncio.sleep(1.5)
+                await self.snap(f"14_confirmed_{s}")
                 break
             except PlaywrightTimeout:
                 continue
@@ -532,7 +552,7 @@ async def main():
             for label, time_str, dur_str in TIME_SLOTS:
                 try:
                     seat = await booker.book_one_slot(label, time_str, dur_str)
-                    results.append((label, f"✅ 成功  座位: {seat}"))
+                    results.append((label, f"✅ 成功  区域: {seat}"))
                 except Exception as e:
                     log.error(f"❌ {label} 失败: {e}")
                     await booker.snap(f"ERR_{_safe(label)}")
