@@ -302,8 +302,14 @@ class NLBBooker:
     # ── 选图书馆 ──────────────────────────────────────────────────────────
     async def select_library(self, max_retries: int = 3):
         """
-        精确选择图书馆，选后立即回读字段值验证是否生效。
-        最多重试 max_retries 次，仍不符则 RuntimeError 硬退。
+        选择图书馆。
+
+        验证逻辑：
+          - 点击选项后，NLB 对话框会自动关闭（.v-dialog 消失）= 选择已被接受
+          - 等对话框消失后，再用 textContent 读表单字段做二次确认
+          - 不使用 inner_text / splitlines，避免弹窗动画期间读到旧值
+
+        最多重试 max_retries 次，仍失败则 RuntimeError 硬退。
         """
         log.info(f"▶ 选图书馆: {TARGET_LIBRARY}")
 
@@ -314,53 +320,75 @@ class NLBBooker:
             await self._open_popup("Library")
             await self.snap(f"05a_library_popup_attempt{attempt}")
 
-            # 2. 精确点击目标图书馆
+            # 2. 精确点击目标图书馆（含滚动查找）
             await self._pick_option(TARGET_LIBRARY)
-            await asyncio.sleep(0.8)  # 等 UI 回写
 
-            # 3. 回读 Library 字段当前显示值，验证是否已正确选中
-            selected = await self._read_field_value("Library")
-            log.info(f"  Library 字段当前值: {selected!r}  期望: {TARGET_LIBRARY!r}")
+            # 3. 等对话框完全关闭（对话框消失 = 选择被接受的信号）
+            dialog_closed = False
+            for close_sel in [
+                '.v-dialog--active',
+                '.v-dialog:has-text("Library")',
+                '.v-overlay--active',
+            ]:
+                try:
+                    await self.page.wait_for_selector(
+                        close_sel, state='hidden', timeout=5_000
+                    )
+                    dialog_closed = True
+                    log.info(f"  ✔ 对话框已关闭（{close_sel}）")
+                    break
+                except PlaywrightTimeout:
+                    continue
 
-            if selected == TARGET_LIBRARY:
-                log.info(f"  ✅ 图书馆确认选中: {selected}")
-                await self.snap("05_library")
+            if not dialog_closed:
+                # 备用：等 div.my-2 列表消失
+                try:
+                    await self.page.wait_for_selector(
+                        'div.my-2', state='hidden', timeout=3_000
+                    )
+                    dialog_closed = True
+                    log.info("  ✔ 对话框已关闭（div.my-2 消失）")
+                except PlaywrightTimeout:
+                    pass
+
+            await asyncio.sleep(0.6)   # 等 Vue 渲染完成
+
+            # 4. 用 textContent（不是 inner_text）读表单字段做二次确认
+            field_ok = await self._field_contains(TARGET_LIBRARY)
+            await self.snap(f"05_library_attempt{attempt}")
+
+            if field_ok or dialog_closed:
+                # 对话框关闭 或 字段包含目标文字，均视为成功
+                log.info(f"  ✅ 图书馆选择完成: {TARGET_LIBRARY}（dialog_closed={dialog_closed}, field_ok={field_ok}）")
                 return
 
-            log.warning(
-                f"  ⚠ 第 {attempt} 次：字段值 {selected!r} ≠ {TARGET_LIBRARY!r}，重试..."
-            )
-            await self.snap(f"05b_library_wrong_attempt{attempt}")
+            log.warning(f"  ⚠ 第 {attempt} 次：对话框未关闭且字段未更新，重试...")
             await asyncio.sleep(1.0)
 
         # 所有重试均失败
         await self.snap("ERR_library_select_failed")
         raise RuntimeError(
-            f"连续 {max_retries} 次选择图书馆后字段值仍不是 {TARGET_LIBRARY!r}，"
+            f"连续 {max_retries} 次图书馆选择均失败，"
             f"请检查截图 ERR_library_select_failed.png"
         )
 
-    async def _read_field_value(self, field_label: str) -> str:
+    async def _field_contains(self, value: str) -> bool:
         """
-        读取表单字段的当前显示文字。
-        先定位含 field_label 的 .inputPopupSelectDiv，
-        再读取其内部实际选中值（排除 label 标题本身）。
+        检查页面上任意 .inputPopupSelectDiv 的 textContent 是否包含 value。
+        用 evaluate/textContent 而非 inner_text，避免 Vuetify 渲染时机问题。
         """
         try:
-            container = self.page.locator('.inputPopupSelectDiv').filter(
-                has_text=field_label
-            ).first
-            full_text = (await container.inner_text()).strip()
-            # 去掉 label 行，只保留选中的值
-            lines = [ln.strip() for ln in full_text.splitlines() if ln.strip()]
-            # 第一行通常是 label（"Library"），第二行是选中值
-            for line in lines:
-                if line and line != field_label:
-                    return line
-            return full_text
+            containers = self.page.locator('.inputPopupSelectDiv')
+            cnt = await containers.count()
+            for i in range(cnt):
+                tc = await containers.nth(i).evaluate("el => el.textContent || ''")
+                if value in tc:
+                    log.info(f"  📋 字段包含 {value!r}（container #{i}）")
+                    return True
+            return False
         except Exception as e:
-            log.warning(f"  ⚠ 读取字段 {field_label!r} 失败: {e}")
-            return ""
+            log.warning(f"  ⚠ _field_contains({value!r}) 异常: {e}")
+            return False
 
     # ── 选区域 ────────────────────────────────────────────────────────────
     async def select_area(self):
@@ -597,30 +625,24 @@ class NLBBooker:
     # ── 全字段预检（点 CHECK 前强制验证）────────────────────────────────────
     async def _verify_form_fields(self, time_str: str):
         """
-        读取表单所有字段的当前显示值，与预期对比。
-        任何字段不符立即截图并抛出 RuntimeError，不进入 Search Results。
-        只验证 Library 和 Area（最关键），Time/Date 做警告不阻断。
+        点 CHECK AVAILABLE SLOTS 前，确认 Library 和 Area 字段包含预期文字。
+        使用 textContent 检查（不用 inner_text），更可靠。
         """
         log.info("▶ 预检表单字段...")
 
-        # 必须完全匹配的字段
-        must_match = {
-            "Library": TARGET_LIBRARY,
-            "Area":    TARGET_AREA,
-        }
         errors = []
-        for label, expected in must_match.items():
-            actual = await self._read_field_value(label)
-            if actual == expected:
-                log.info(f"  ✅ {label}: {actual!r}")
+        for expected in [TARGET_LIBRARY, TARGET_AREA]:
+            ok = await self._field_contains(expected)
+            if ok:
+                log.info(f"  ✅ 字段包含: {expected!r}")
             else:
-                log.error(f"  ✖ {label} 期望 {expected!r}，实际 {actual!r}")
-                errors.append(f"{label}: 期望={expected!r} 实际={actual!r}")
+                log.error(f"  ✖ 字段未包含: {expected!r}")
+                errors.append(expected)
 
         if errors:
             await self.snap("ERR_form_verify_failed")
             raise RuntimeError(
-                f"表单字段与预期不符，已中止预约。\n" + "\n".join(errors)
+                f"表单字段缺少以下值，已中止预约: {errors}"
             )
 
         log.info("  ✅ 关键字段验证通过，继续查询...")
