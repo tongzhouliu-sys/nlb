@@ -370,8 +370,11 @@ class NLBBooker:
         在已打开的 Radio 对话框中点击匹配文字的选项。
         Time / Duration / Area 对话框均用此方法。
         采用精确完整文字匹配，避免 "2:00 pm" 误中 "12:00 pm"。
+
+        关键修复：弹窗列表可能需要滚动（如 "2:00 pm" 在视口外），
+        必须先 scroll_into_view_if_needed() 再判断可见性，不能依赖 is_visible()。
         """
-        # 策略1：label 精确匹配（Vuetify radio label）
+        # 策略1：label / radio 精确匹配 + 强制滚动到视口
         for sel in [
             f'label:has-text("{option_text}")',
             f'.v-radio:has-text("{option_text}")',
@@ -381,7 +384,8 @@ class NLBBooker:
             try:
                 el = self.page.locator(sel).first
                 if await el.count() > 0:
-                    await el.scroll_into_view_if_needed()
+                    await el.scroll_into_view_if_needed()   # ← 先滚动，再点
+                    await asyncio.sleep(0.2)
                     await el.click()
                     log.info(f"  ✔ 已选: {option_text}（{sel}）")
                     await asyncio.sleep(0.5)
@@ -389,20 +393,24 @@ class NLBBooker:
             except Exception:
                 continue
 
-        # 策略2：遍历 div.my-2，逐一检查可见性 + 精确文字
+        # 策略2：遍历 div.my-2，精确文字匹配后强制滚动到视口再点击
+        # 注意：不能用 is_visible() 过滤，因为目标选项可能在滚动区域外而被判为不可见
         items = self.page.locator('div.my-2')
         cnt = await items.count()
+        log.info(f"  🔎 弹窗共 {cnt} 个选项，查找: {option_text!r}")
         for i in range(cnt):
             el = items.nth(i)
             try:
-                if not await el.is_visible():
-                    continue
                 txt = (await el.inner_text()).strip()
-                if txt == option_text:
-                    await el.click()
-                    log.info(f"  ✔ 已选(div.my-2): {txt}")
-                    await asyncio.sleep(0.5)
-                    return
+                if txt != option_text:
+                    continue
+                # 找到目标项：先滚动到视口，再点击
+                await el.scroll_into_view_if_needed()
+                await asyncio.sleep(0.2)
+                await el.click()
+                log.info(f"  ✔ 已选(div.my-2 滚动): {txt}")
+                await asyncio.sleep(0.5)
+                return
             except Exception:
                 continue
 
@@ -540,11 +548,18 @@ class NLBBooker:
         座位优先级：
           第一序列 S74-S86 → 第二序列 S1-S16 → 其他可用座位（兜底）
 
+        关键修复：座位列表需要滚动，不能用 is_visible() 过滤，
+        收集阶段只排除明确禁用的座位，点击前统一 scroll_into_view_if_needed()。
+
         返回实际选中的座位号；若无任何可用座位则抛出 RuntimeError。
         """
         # ── 收集页面上所有可用（未禁用）座位元素 ────────────────────────
         async def _get_available_seats() -> dict[str, object]:
-            """返回 {座位号: locator} 的字典，只含可用座位。"""
+            """
+            返回 {座位号: locator} 的字典。
+            不做 is_visible() 过滤——视口外的座位同样需要被发现，
+            点击时再 scroll_into_view_if_needed() 滚动进来。
+            """
             available: dict[str, object] = {}
             for sel in [
                 '[class*="seat"]:not([class*="disabled"]):not([class*="unavailable"])',
@@ -556,11 +571,10 @@ class NLBBooker:
                 cnt = await els.count()
                 if cnt == 0:
                     continue
+                log.info(f"  🔎 selector={sel!r} 匹配到 {cnt} 个元素")
                 for i in range(cnt):
                     el = els.nth(i)
                     try:
-                        if not await el.is_visible():
-                            continue
                         # 获取座位号：优先 data-seat，其次 aria-label，最后 inner_text
                         seat_id = (
                             await el.get_attribute("data-seat")
@@ -570,7 +584,7 @@ class NLBBooker:
                         if not seat_id:
                             continue
                         seat_id = seat_id.strip().upper()
-                        # 过滤掉明确禁用的
+                        # 仅排除 class 中明确标注禁用的座位
                         cls = (await el.get_attribute("class")) or ""
                         if any(k in cls.lower() for k in ("disabled", "unavailable", "booked", "occupied")):
                             continue
@@ -582,7 +596,7 @@ class NLBBooker:
             return available
 
         available = await _get_available_seats()
-        log.info(f"  📋 可用座位数: {len(available)}  示例: {list(available.keys())[:10]}")
+        log.info(f"  📋 可用座位数: {len(available)}  全部: {sorted(available.keys())}")
 
         if not available:
             log.warning("  ⚠ 未检测到可用座位，尝试直接进入预约详情页（系统自动分配）")
@@ -591,7 +605,6 @@ class NLBBooker:
         # ── 按优先级构造候选序列 ─────────────────────────────────────────
         # Tier 3：页面上有但不在 Tier1/Tier2 的座位，保持页面顺序
         tier3 = [sid for sid in available if sid not in _TIER3_EXCLUDE]
-        ordered_candidates = _TIER1 + _TIER2 + tier3
 
         # ── 逐个尝试 ────────────────────────────────────────────────────
         for tier_label, seats in [
@@ -599,13 +612,15 @@ class NLBBooker:
             ("第二序列(S1-S16)",  _TIER2),
             ("其他座位",          tier3),
         ]:
-            log.info(f"  🔍 尝试 {tier_label}...")
+            log.info(f"  🔍 尝试 {tier_label}，候选: {[s for s in seats if s in available]}")
             for seat_id in seats:
                 if seat_id not in available:
                     continue
                 el = available[seat_id]
                 try:
+                    # 先滚动到视口（座位可能在屏幕外），再等动画，再点击
                     await el.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.3)
                     await el.click()
                     log.info(f"  ✅ 已选座位: {seat_id}（{tier_label}）")
                     await asyncio.sleep(0.8)
