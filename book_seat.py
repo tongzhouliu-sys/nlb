@@ -285,8 +285,19 @@ class NLBBooker:
         target = datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
         log.info(f"  设置 Date = {target.strftime('%d %b %Y')}")
 
-        # Date 字段也是 inputPopupSelectDiv，点击打开日历
-        await self._open_popup("Date")
+        # Date 字段打开的是日历组件，不是 div.my-2 下拉列表，
+        # 不能用 _open_popup()（它会等 div.my-2 可见，从而超时）。
+        trigger = self.page.locator('.inputPopupSelectDiv').filter(has_text="Date").first
+        await trigger.wait_for(state="visible", timeout=10_000)
+        await trigger.click()
+        # 等日历本体出现（Vuetify date-picker 或通用 calendar 容器）
+        await self.page.wait_for_selector(
+            '.v-date-picker-header, [class*="datepicker"], '
+            '[class*="calendar"], [class*="picker-title"], '
+            'button.v-btn[aria-label]',   # 日历里的日期按钮
+            timeout=10_000,
+        )
+        await asyncio.sleep(0.3)
         await self.snap("07_calendar")
 
         # 翻到目标月份
