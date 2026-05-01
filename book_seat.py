@@ -1,26 +1,19 @@
 """
-NLB Seat Booking Automation Script  (v8 — 彻底根除残留 DOM 污染)
+NLB Seat Booking Automation Script  (v9 — 座位图诊断 + Preferred Seat弹窗放宽)
 =========================================================================
-v8 核心修复（基于第二轮日志分析）：
+v9 新增（基于"上午AUTO"问题分析）：
+  1. 【座位图诊断】_pick_seat_by_priority 打印命中元素的全部属性（class/data-seat/
+     aria-label/inner_text），搞清楚 NLB 座位图用什么字段存座位 ID
+  2. 【Preferred Seat 弹窗放宽】_pick_preferred_seat_in_dialog 放弃严格 ^S[0-9]+$ 正则，
+     改为：打印弹窗所有原始文字，同时接受 "S74"/"74"/"Seat74" 等多种格式，
+     过滤掉明显非座位条目（图书馆名/时间/区域/Duration选项）
 
-  1. 【Duration 60秒卡顿】_pick_dialog_radio 策略1 用全局 label 选择器，
-     命中 Time 弹窗残留的 "1:30 PM" label（不可见），scroll_into_view_if_needed
-     默认 30s 超时，4个选择器 × 偶尔命中 = 合计 60s。
-     修复：所有策略1选择器改成在 .v-dialog--active 内相对查找；
-           scroll_into_view_if_needed 加 timeout=3_000 快速失败。
-
-  2. 【Preferred Seat 弹窗 95项污染】_pick_preferred_seat_in_dialog 用
-     '.v-dialog label'（匹配所有历史弹窗），导致读到图书馆名 / 时间 / 区域，
-     真实座位号（S数字）完全被淹没，优先级选座 0 命中，每项 30s 超时累加。
-     修复：改用 .v-dialog--active 限定当前活跃弹窗；
-           加入 S数字 格式过滤，非座位条目直接跳过；
-           弹窗内添加滚动扫描逻辑。
-
-  3. 【_verify_form_fields 误报】Vuetify textContent 读不到选中值，改为 warn-only。
-
-  4. 【Duration 候选顺序】"1:30" 调到第一位，消除无效扫描。
-
-继承 v6：图书馆精确选择 + 重试机制 + Preferred Seat 弹窗选座 + Duration 多候选探测
+v8 继承修复：
+  - _pick_dialog_radio 策略1 限定在 .v-dialog--active；scroll_into_view_if_needed timeout=3s
+  - _pick_preferred_seat_in_dialog 限定在 .v-dialog--active
+  - div.my-2 全局选择器改成弹窗内相对查找
+  - _verify_form_fields 改为 warn-only
+  - Duration 候选 "1:30" 调到第一位
 """
 
 import os
@@ -260,7 +253,6 @@ class NLBBooker:
         max_scrolls = 20
         scroll_step_px = 300
 
-        # 把 div.my-2 限定在当前打开的弹窗容器内，避免读到已关闭弹窗残留的 DOM 节点
         dialog_scope = (
             scroll_container
             if scroll_container is not None
@@ -531,16 +523,12 @@ class NLBBooker:
     async def _pick_dialog_radio(self, option_text: str):
         """
         在已打开的 Radio 对话框中点击匹配文字的选项。
-        Time / Duration / Area 对话框均用此方法。
-        采用精确完整文字匹配，避免 "2:00 pm" 误中 "12:00 pm"。
 
         关键修复：
-          1. 所有选择器均限定在当前活跃弹窗（.v-dialog--active）内，
-             防止已关闭弹窗的残留 DOM 节点污染匹配结果。
-          2. scroll_into_view_if_needed 使用 3 秒短超时，
-             不可见的残留元素快速失败，不会卡 30 秒。
+          1. 所有选择器限定在 .v-dialog--active 内，防止旧弹窗 DOM 残留污染。
+          2. 策略1的 scroll_into_view_if_needed 用 3s 短超时，不可见残留元素快速失败。
         """
-        # ── 找到当前活跃弹窗容器 ──────────────────────────────────────────
+        # 找当前活跃弹窗容器
         dialog_root = None
         for active_sel in [
             '.v-dialog--active',
@@ -550,14 +538,13 @@ class NLBBooker:
             loc = self.page.locator(active_sel)
             if await loc.count() > 0:
                 dialog_root = loc.first
-                log.info(f"  弹窗容器（策略1）: {active_sel!r}")
+                log.info(f"  弹窗容器: {active_sel!r}")
                 break
         if dialog_root is None:
-            # 兜底：取页面最后一个 v-dialog
             dialog_root = self.page.locator('.v-dialog, [role="dialog"]').last
-            log.info("  弹窗容器（策略1 兜底）: 最后一个 .v-dialog")
+            log.info("  弹窗容器（兜底）: 最后一个 .v-dialog")
 
-        # ── 策略1：在活跃弹窗内用 label/radio 选择器精确匹配 ─────────────
+        # 策略1：在活跃弹窗内用 label/radio 选择器，3s 短超时快速失败
         for rel_sel in [
             f'label:has-text("{option_text}")',
             f'.v-radio:has-text("{option_text}")',
@@ -567,7 +554,6 @@ class NLBBooker:
             try:
                 el = dialog_root.locator(rel_sel).first
                 if await el.count() > 0:
-                    # 短超时：不可见的残留元素 3s 内失败，不卡 30s
                     await el.scroll_into_view_if_needed(timeout=3_000)
                     await asyncio.sleep(0.2)
                     await el.click()
@@ -577,8 +563,7 @@ class NLBBooker:
             except Exception:
                 continue
 
-        # ── 策略2：在活跃弹窗内遍历 div.my-2，精确文字匹配后滚动点击 ──────
-        # 不能用 is_visible() 过滤，因为目标选项可能在滚动区域外而被判为不可见
+        # 策略2：遍历活跃弹窗内的 div.my-2
         items = dialog_root.locator('div.my-2')
         cnt = await items.count()
         log.info(f"  🔎 弹窗共 {cnt} 个选项，查找: {option_text!r}")
@@ -588,11 +573,10 @@ class NLBBooker:
                 txt = (await el.inner_text()).strip()
                 if txt != option_text:
                     continue
-                # 找到目标项：先滚动到视口，再点击
                 await el.scroll_into_view_if_needed()
                 await asyncio.sleep(0.2)
                 await el.click()
-                log.info(f"  ✔ 已选(div.my-2 滚动): {txt}")
+                log.info(f"  ✔ 已选(div.my-2): {txt}")
                 await asyncio.sleep(0.5)
                 return
             except Exception:
@@ -631,8 +615,9 @@ class NLBBooker:
         await asyncio.sleep(0.8)
         await self.snap("10_dur_popup")
 
-        # 先记录弹窗所有选项，便于调试
-        items = self.page.locator('div.my-2')
+        # 先记录弹窗所有选项（限定在当前活跃弹窗内）
+        dialog_root = self.page.locator('.v-dialog, [role="dialog"]').last
+        items = dialog_root.locator('div.my-2')
         cnt = await items.count()
         all_opts = []
         for i in range(cnt):
@@ -659,22 +644,15 @@ class NLBBooker:
         else:
             raise RuntimeError(f"Duration 弹窗无可用选项，候选: {dur_candidates}")
 
-    # ── 全字段预检（点 CHECK 前，仅记录警告，不阻断流程）────────────────────
+    # ── 全字段预检（仅警告，不阻断）─────────────────────────────────────────
     async def _verify_form_fields(self, time_str: str):
-        """
-        点 CHECK AVAILABLE SLOTS 前，尝试确认 Library 和 Area 字段包含预期文字。
-        Vuetify 选中值通过内部状态渲染，textContent 读不到时直接误报，
-        改为 warn-only，不再抛出异常。
-        """
         log.info("▶ 预检表单字段（仅警告，不阻断）...")
         for expected in [TARGET_LIBRARY, TARGET_AREA]:
             ok = await self._field_contains(expected)
             if ok:
                 log.info(f"  ✅ 字段包含: {expected!r}")
             else:
-                log.warning(
-                    f"  ⚠ textContent 未读到 {expected!r}（Vuetify 内部状态，忽略继续）"
-                )
+                log.warning(f"  ⚠ textContent 未读到 {expected!r}（Vuetify 内部状态，忽略继续）")
         log.info("  ✅ 预检完成，继续查询...")
 
     # ── CHECK AVAILABLE SLOTS ─────────────────────────────────────────────
@@ -833,16 +811,17 @@ class NLBBooker:
 
     async def _pick_preferred_seat_in_dialog(self) -> str:
         """
-        在 Preferred Seat 弹窗内，按优先级选择座位：
-          第一序列 S74-S86 → 第二序列 S1-S16 → 其他可选座位
+        在 Preferred Seat 弹窗内，按优先级选择座位。
 
-        关键修复：必须把所有选择器限定在当前活跃弹窗（.v-dialog--active）内，
-        否则 Library / Area / Time / Duration 的残留 DOM label 会污染结果（共 95 项）。
-        同时对弹窗内列表做滚动扫描，确保找到视口外的座位选项。
+        v9 修复：
+          1. 限定在 .v-dialog--active，不再被历史弹窗 DOM 残留污染。
+          2. 打印弹窗所有原始文字，方便日志诊断座位标签格式。
+          3. 放宽座位号识别：接受 "S74"/"74"/"SEAT74" 等多种格式，
+             用黑名单（图书馆名/时间/区域/Duration）过滤明显非座位条目。
         """
-        await asyncio.sleep(0.5)  # 等弹窗内容完全渲染
+        await asyncio.sleep(0.5)
 
-        # ── 找到当前活跃弹窗容器 ─────────────────────────────────────────
+        # ── 找当前活跃弹窗容器 ───────────────────────────────────────────
         active_dialog = None
         for active_sel in [
             '.v-dialog--active',
@@ -855,48 +834,71 @@ class NLBBooker:
                 log.info(f"  Preferred Seat 弹窗容器: {active_sel!r}")
                 break
         if active_dialog is None:
-            # 兜底：包含 "Preferred Seat" 文字的最后一个 v-dialog
             active_dialog = self.page.locator(
                 '.v-dialog:has-text("Preferred Seat"), [role="dialog"]:has-text("Preferred Seat")'
             ).last
-            log.info("  Preferred Seat 弹窗容器（兜底）: :has-text('Preferred Seat')")
+            log.info("  Preferred Seat 弹窗容器（兜底）")
 
-        # ── 收集弹窗内所有座位选项（需滚动扫描）─────────────────────────
+        # ── 黑名单：明确不是座位的条目 ───────────────────────────────────
+        import re as _re
+        _BLACKLIST_PATTERNS = [
+            _re.compile(r'\d{1,2}:\d{2}\s*(AM|PM)', _re.IGNORECASE),  # 时间 "10:00AM"
+            _re.compile(r'\d+:\d{2}$'),            # Duration "1:30"
+            _re.compile(r'LIBRARY$'),              # 图书馆名
+            _re.compile(r'LEVEL\s*\d'),            # 区域含 Level
+            _re.compile(r'ZONE'),                  # 区域含 Zone
+            _re.compile(r'NO\s+PREFERRED', _re.IGNORECASE),
+        ]
+
+        def _is_likely_seat(raw: str) -> bool:
+            """粗判断：是否像座位号而非图书馆/时间/区域"""
+            u = raw.upper().replace(" ", "")
+            for pat in _BLACKLIST_PATTERNS:
+                if pat.search(u):
+                    return False
+            # 接受 "S74" / "74" / "SEAT74" / "S-74" 等
+            if _re.search(r'S[-]?\d+', u):
+                return True
+            if _re.fullmatch(r'\d+', u):
+                return True
+            # 其他短字符串也暂时保留，日志会打出来
+            if len(u) <= 8 and u:
+                return True
+            return False
+
+        # ── 收集弹窗内所有选项（含滚动扫描）────────────────────────────
         available_in_dialog: dict[str, object] = {}
+        all_raw_texts: list[str] = []
 
-        # 找弹窗内的可滚动列表容器
         scroll_container = None
-        for sc_sel in ['.v-list', '[class*="list"]', '.v-card__text', '.v-dialog__content']:
+        for sc_sel in ['.v-list', '[class*="list"]', '.v-card__text']:
             sc = active_dialog.locator(sc_sel).first
             if await sc.count() > 0:
                 scroll_container = sc
                 break
 
-        # 滚动扫描弹窗，收集所有 radio/label/div.my-2 选项
         for rel_sel in ['label', '[role="radio"]', '.v-radio', 'div.my-2']:
             if available_in_dialog:
                 break
-            max_seat_scrolls = 15
-            for scroll_idx in range(max_seat_scrolls + 1):
+            for scroll_idx in range(16):
                 els = active_dialog.locator(rel_sel)
                 cnt = await els.count()
                 for i in range(cnt):
                     el = els.nth(i)
                     try:
                         txt = (await el.inner_text()).strip()
-                        if not txt or txt.lower() in ("no preferred seat", ""):
+                        if not txt:
                             continue
-                        seat_key = txt.upper().replace(" ", "")
-                        # 只收集看起来像座位号的条目（S + 数字）
-                        if seat_key not in available_in_dialog:
-                            available_in_dialog[seat_key] = el
+                        if txt not in all_raw_texts:
+                            all_raw_texts.append(txt)
+                        key = txt.upper().replace(" ", "")
+                        if key not in available_in_dialog and _is_likely_seat(txt):
+                            available_in_dialog[key] = el
                     except Exception:
                         continue
 
-                if scroll_idx >= max_seat_scrolls:
+                if scroll_idx >= 15:
                     break
-
-                # 滚动弹窗查找更多选项
                 if scroll_container and await scroll_container.count() > 0:
                     at_bottom = await scroll_container.evaluate(
                         "el => el.scrollTop + el.clientHeight >= el.scrollHeight - 5"
@@ -906,38 +908,40 @@ class NLBBooker:
                     await scroll_container.evaluate("el => el.scrollBy(0, 200)")
                 else:
                     await active_dialog.evaluate("el => el.scrollBy(0, 200)")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.2)
 
             if available_in_dialog:
-                log.info(f"  📋 Preferred Seat 弹窗可选项（{rel_sel}）: {sorted(available_in_dialog.keys())}")
+                log.info(f"  📋 弹窗所有原始文字({rel_sel}): {all_raw_texts}")
+                log.info(f"  🪑 过滤后候选: {sorted(available_in_dialog.keys())}")
                 break
 
         if not available_in_dialog:
-            log.warning("  ⚠ Preferred Seat 弹窗未找到具体座位选项，保持 'No preferred seat'")
+            log.warning(f"  ⚠ 弹窗所有原始文字: {all_raw_texts}")
+            log.warning("  ⚠ 未找到座位候选，保持 'No preferred seat'")
             return "AUTO"
-
-        # ── 过滤：只保留 "S数字" 格式的真实座位号 ─────────────────────────
-        import re as _re
-        seat_pattern = _re.compile(r'^S\d+$')
-        real_seats = {k: v for k, v in available_in_dialog.items() if seat_pattern.match(k)}
-        if not real_seats:
-            log.warning(f"  ⚠ 未找到 S数字 格式的座位，全部选项: {sorted(available_in_dialog.keys())}")
-            log.warning("  ⚠ 保持 'No preferred seat'")
-            return "AUTO"
-
-        log.info(f"  🪑 真实座位号: {sorted(real_seats.keys())}")
 
         # ── 按优先级选座 ─────────────────────────────────────────────────
-        tier3 = [sid for sid in real_seats if sid not in _TIER3_EXCLUDE]
+        # 标准化：把 "74" 映射成 "S74" 方便与 _TIER1/_TIER2 对比
+        def _normalize(k: str) -> str:
+            if _re.fullmatch(r'\d+', k):
+                return f"S{k}"
+            if k.startswith("SEAT"):
+                return "S" + k[4:]
+            return k
+
+        normalized = {_normalize(k): v for k, v in available_in_dialog.items()}
+        log.info(f"  🪑 标准化后: {sorted(normalized.keys())}")
+
+        tier3 = [sid for sid in normalized if sid not in _TIER3_EXCLUDE]
         for tier_label, seats in [
             ("第一序列(S74-S86)", _TIER1),
             ("第二序列(S1-S16)",  _TIER2),
             ("其他座位",          tier3),
         ]:
-            candidates = [s for s in seats if s in real_seats]
+            candidates = [s for s in seats if s in normalized]
             log.info(f"  🔍 弹窗尝试 {tier_label}，候选: {candidates}")
             for seat_id in candidates:
-                el = real_seats[seat_id]
+                el = normalized[seat_id]
                 try:
                     await el.scroll_into_view_if_needed()
                     await asyncio.sleep(0.3)
@@ -949,7 +953,7 @@ class NLBBooker:
                     log.warning(f"  ⚠ 弹窗点击 {seat_id} 失败: {e}")
                     continue
 
-        log.warning("  ⚠ Preferred Seat 弹窗所有优先级座位均不可用，保持默认")
+        log.warning("  ⚠ 所有优先级座位均不可用，保持默认")
         return "AUTO"
 
     async def _click_confirm_dialog(self, label_safe: str):
@@ -981,8 +985,8 @@ class NLBBooker:
         async def _get_available_seats() -> dict[str, object]:
             """
             返回 {座位号: locator} 的字典。
-            不做 is_visible() 过滤——视口外的座位同样需要被发现，
-            点击时再 scroll_into_view_if_needed() 滚动进来。
+            不做 is_visible() 过滤——视口外的座位同样需要被发现。
+            v9 新增：打印每个命中元素的全部属性，用于诊断 NLB 座位图的 DOM 结构。
             """
             available: dict[str, object] = {}
             for sel in [
@@ -999,24 +1003,35 @@ class NLBBooker:
                 for i in range(cnt):
                     el = els.nth(i)
                     try:
-                        # 获取座位号：优先 data-seat，其次 aria-label，最后 inner_text
-                        seat_id = (
-                            await el.get_attribute("data-seat")
-                            or await el.get_attribute("aria-label")
-                            or (await el.inner_text()).strip()
+                        # ── 诊断：打印元素所有属性，帮助识别座位 ID 字段 ──
+                        tag      = await el.evaluate("e => e.tagName")
+                        cls_val  = await el.get_attribute("class") or ""
+                        ds       = await el.get_attribute("data-seat") or ""
+                        aria     = await el.get_attribute("aria-label") or ""
+                        txt      = (await el.inner_text()).strip()
+                        all_attrs = await el.evaluate(
+                            "e => Object.fromEntries([...e.attributes].map(a=>[a.name,a.value]))"
                         )
+                        log.info(
+                            f"  📍 元素#{i}: <{tag}> class={cls_val!r} "
+                            f"data-seat={ds!r} aria-label={aria!r} text={txt!r} "
+                            f"all_attrs={all_attrs}"
+                        )
+                        # 获取座位号：优先 data-seat，其次 aria-label，最后 inner_text
+                        seat_id = ds or aria or txt
                         if not seat_id:
+                            log.info(f"  ⚠ 元素#{i}: 无法读取座位号，跳过")
                             continue
                         seat_id = seat_id.strip().upper()
-                        # 仅排除 class 中明确标注禁用的座位
-                        cls = (await el.get_attribute("class")) or ""
-                        if any(k in cls.lower() for k in ("disabled", "unavailable", "booked", "occupied")):
+                        if any(k in cls_val.lower() for k in ("disabled", "unavailable", "booked", "occupied")):
+                            log.info(f"  ⚠ 元素#{i} {seat_id}: class 含禁用标记，跳过")
                             continue
                         available[seat_id] = el
-                    except Exception:
+                    except Exception as e:
+                        log.warning(f"  ⚠ 元素#{i} 处理异常: {e}")
                         continue
                 if available:
-                    break   # 找到结果就不再尝试下一个 selector
+                    break
             return available
 
         available = await _get_available_seats()
