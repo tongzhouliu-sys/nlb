@@ -67,15 +67,16 @@ class NLBBooker:
     # ── 登录 ──────────────────────────────────────────────────────────────
     async def login(self):
         """
-        正确登录流程：
+        登录流程（v4）：
           1. 打开座位预约主页
           2. 点击底部 "Account" Tab → 跳转到 CAS 登录页
-          3. 填写账号密码并提交
-          4. 等待跳回 nlb.gov.sg，确认已登录
+          3. NLB 登录页默认显示 QR 登录，先切换到密码登录 Tab
+          4. 填写账号密码并提交
+          5. 等待跳回 nlb.gov.sg，确认已登录
         """
         log.info("▶ 打开主页...")
         await self.page.goto(BASE_URL, wait_until="load")
-        await asyncio.sleep(2)   # SPA 初始化缓冲
+        await asyncio.sleep(2)
         await self.snap("01_home")
 
         # 步骤 1：点击底部导航 "Account" Tab
@@ -95,58 +96,144 @@ class NLBBooker:
         await self.snap("02_account_tab")
         log.info(f"  Account 页 URL: {self.page.url}")
 
-        # 步骤 2：如果跳转到 CAS 登录页，填写账密
+        # 步骤 2：如果跳转到 CAS 登录页，切换到密码登录后填写账密
         if "signin.nlb.gov.sg" in self.page.url or "login" in self.page.url.lower():
-            log.info("▶ 检测到登录页，填写账号密码...")
-            await self.page.wait_for_selector(
-                'input[name="username"], input[name="userId"], input[type="text"]',
-                timeout=20_000
-            )
-            await self.page.fill(
-                'input[name="username"], input[name="userId"], '
-                'input[placeholder*="ID" i], input[type="text"]',
-                NLB_USERNAME
-            )
-            await self.page.fill(
-                'input[name="password"], input[type="password"]',
-                NLB_PASSWORD
-            )
+            await self.snap("03a_login_page_raw")
+
+            # ── 切换到「密码登录」Tab ──────────────────────────────────────
+            # NLB 登录页默认显示 QR 登录；需要先点切换到密码/NLB ID 登录
+            log.info("▶ 尝试切换到密码登录 Tab...")
+            password_tab_selectors = [
+                # 常见文字标签（中英文均尝试）
+                '[role="tab"]:has-text("Password")',
+                '[role="tab"]:has-text("NLB")',
+                'a:has-text("Password Login")',
+                'a:has-text("Login with Password")',
+                'a:has-text("NLB ID")',
+                'button:has-text("Password")',
+                'button:has-text("NLB ID")',
+                'li:has-text("Password")',
+                # CAS 页面常见 Tab class
+                '.tab:has-text("Password")',
+                '.nav-link:has-text("Password")',
+                '.nav-item:has-text("Password")',
+                # 通用兜底：包含 password 的链接
+                'a[href*="password" i]',
+                'a[href*="nlbid" i]',
+            ]
+            switched = False
+            for sel in password_tab_selectors:
+                try:
+                    el = self.page.locator(sel).first
+                    if await el.count() > 0:
+                        await el.wait_for(state="visible", timeout=3_000)
+                        await el.click()
+                        await asyncio.sleep(1)
+                        log.info(f"  ✔ 已切换密码登录 Tab（{sel}）")
+                        switched = True
+                        break
+                except Exception:
+                    continue
+            if not switched:
+                log.warning("  ⚠ 未找到密码登录 Tab，尝试直接填写（截图 03a 供调查）")
+
+            await self.snap("03b_after_tab_switch")
+
+            # ── 填写账号密码 ───────────────────────────────────────────────
+            log.info("▶ 填写账号密码...")
+            # 等密码框出现（确保密码登录表单已激活）
+            try:
+                await self.page.wait_for_selector(
+                    'input[type="password"]', timeout=10_000
+                )
+            except PlaywrightTimeout:
+                log.warning("  ⚠ 10s 内未找到 password 字段，截图留证")
+                await self.snap("03c_no_password_field")
+
+            # 填用户名：优先用 name/placeholder 精确匹配，避免误填搜索框
+            for u_sel in [
+                'input[name="username"]',
+                'input[name="userId"]',
+                'input[name="user"]',
+                'input[autocomplete="username"]',
+                'input[placeholder*="ID" i]',
+                'input[placeholder*="username" i]',
+            ]:
+                try:
+                    el = self.page.locator(u_sel).first
+                    if await el.count() > 0:
+                        await el.fill(NLB_USERNAME)
+                        log.info(f"  ✔ 用户名已填（{u_sel}）")
+                        break
+                except Exception:
+                    continue
+
+            # 填密码
+            await self.page.fill('input[type="password"]', NLB_PASSWORD)
             await self.snap("03_creds_filled")
 
-            submit = self.page.locator(
-                'input[type="submit"], button[type="submit"], '
-                'button:has-text("Login"), button:has-text("Log in"), '
-                'button:has-text("Sign in")'
-            ).first
-            await submit.wait_for(state="visible", timeout=10_000)
-            await submit.click()
+            # ── 点击提交（只点密码表单内的 submit，不点 QR 相关按钮） ───────
+            submit_selectors = [
+                # 优先：包含 password 的表单内的按钮
+                'form:has(input[type="password"]) input[type="submit"]',
+                'form:has(input[type="password"]) button[type="submit"]',
+                'form:has(input[type="password"]) button:has-text("Login")',
+                'form:has(input[type="password"]) button:has-text("Log in")',
+                # 通用兜底
+                'input[type="submit"][value*="Login" i]',
+                'button[type="submit"]:has-text("Login")',
+                'button[type="submit"]:has-text("Log in")',
+                'button[type="submit"]:has-text("Sign in")',
+                'input[type="submit"]',
+                'button[type="submit"]',
+            ]
+            clicked_submit = False
+            for sel in submit_selectors:
+                try:
+                    btn = self.page.locator(sel).first
+                    if await btn.count() > 0:
+                        await btn.wait_for(state="visible", timeout=5_000)
+                        await btn.click()
+                        log.info(f"  ✔ 已点提交按钮（{sel}）")
+                        clicked_submit = True
+                        break
+                except Exception:
+                    continue
+            if not clicked_submit:
+                log.warning("  ⚠ 未找到 submit 按钮，尝试回车提交")
+                await self.page.keyboard.press("Enter")
 
-            # 等待 OAuth 多级跳转完成：URL 离开 signin.nlb.gov.sg 即可
-            # 不用 networkidle —— SPA 页面永远有后台 XHR，networkidle 会超时
+            # ── 等待 OAuth 跳转完成 ────────────────────────────────────────
+            # 等 URL 离开 signin 页（不用 networkidle，SPA 始终有后台 XHR）
             try:
                 await self.page.wait_for_function(
                     "() => !window.location.hostname.includes('signin.nlb.gov.sg')",
                     timeout=60_000,
                 )
             except PlaywrightTimeout:
-                log.warning("  ⚠ 60s 内 URL 未离开 signin 页，继续尝试...")
+                log.warning("  ⚠ 60s 内 URL 未离开 signin 页，继续检查...")
 
-            # 再等页面基本加载完（用 load，不用 networkidle）
             try:
-                await self.page.wait_for_load_state("load", timeout=30_000)
+                await self.page.wait_for_load_state("load", timeout=20_000)
             except PlaywrightTimeout:
                 pass
-            await asyncio.sleep(2)  # SPA 路由渲染缓冲
+            await asyncio.sleep(2)
             await self.snap("04_after_submit")
             log.info(f"  提交后 URL: {self.page.url}")
 
         # 步骤 3：确认已登录（不再停在 signin 页）
-        if "signin.nlb.gov.sg" in self.page.url:
+        current_url = self.page.url
+        if "signin.nlb.gov.sg" in current_url:
+            if "qrlogin" in current_url:
+                raise RuntimeError(
+                    "登录失败：页面跳到了 QR 登录页，说明密码登录 Tab 切换未成功。"
+                    f"\n请检查截图 03a/03b 确认登录页 Tab 结构。URL={current_url}"
+                )
             raise RuntimeError(
-                f"登录失败！请检查账号密码和截图 03_creds_filled.png。URL={self.page.url}"
+                f"登录失败！请检查账号密码和截图 03_creds_filled.png。URL={current_url}"
             )
 
-        # 步骤 4：确认 Account 页显示已登录状态（有用户名 / logout 按钮等）
+        # 步骤 4：确认 Account 页显示已登录状态
         await self.snap("05_logged_in_account")
         log.info("✅ 登录成功")
 
@@ -158,10 +245,7 @@ class NLBBooker:
         # 点底部导航 "New" Tab
         try:
             await self.page.locator('.v-btn__content:has-text("New")').first.click()
-            try:
-                await self.page.wait_for_load_state("load", timeout=20_000)
-            except PlaywrightTimeout:
-                pass
+            await self.page.wait_for_load_state("load", timeout=15_000)
         except PlaywrightTimeout:
             pass
         # 等 inputPopupSelectDiv 表单主体出现
