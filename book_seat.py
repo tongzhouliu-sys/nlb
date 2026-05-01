@@ -223,31 +223,80 @@ class NLBBooker:
 
     async def _pick_option(self, option_text: str):
         """
-        在已打开的弹窗里，从 div.my-2 列表中精确选择 option_text。
-        只做完整文字匹配，不使用宽泛兜底——防止选错图书馆/区域。
-        找不到时列出所有选项并抛出 RuntimeError。
+        在已打开的弹窗里，精确选择 option_text。
+
+        弹窗列表是可滚动的，Punggol Library 等选项可能在视窗下方尚未渲染。
+        策略：
+          1. 先找弹窗的可滚动容器
+          2. 每次向下滚动一屏，扫描当前 div.my-2 列表
+          3. 找到精确匹配就立即点击并返回
+          4. 滚到底仍未找到 → 列出所有已见选项并抛错
         """
-        items = self.page.locator('div.my-2')
-        cnt = await items.count()
-        all_opts = []
-        for i in range(cnt):
-            el = items.nth(i)
-            try:
-                txt = (await el.inner_text()).strip()
-                all_opts.append(txt)
-                if txt == option_text:
-                    await el.scroll_into_view_if_needed()
-                    await asyncio.sleep(0.2)
-                    await el.click()
-                    log.info(f"  ✔ 已选: {txt}")
-                    await asyncio.sleep(0.5)
-                    return
-            except Exception:
-                continue
-        # 精确匹配失败 → 记录弹窗实际内容，抛出错误
-        log.error(f"  ✖ 弹窗实际选项: {all_opts}")
+        # 定位弹窗滚动容器（尝试多种选择器）
+        scroll_container = None
+        for sel in [
+            '.v-dialog .v-list',
+            '.v-dialog [class*="list"]',
+            '.v-dialog__content .v-list',
+            '.v-menu__content',
+            '.v-dialog',
+        ]:
+            el = self.page.locator(sel).first
+            if await el.count() > 0:
+                scroll_container = el
+                log.info(f"  弹窗滚动容器: {sel!r}")
+                break
+
+        all_opts_seen: list[str] = []
+        max_scrolls = 20
+        scroll_step_px = 300
+
+        for scroll_idx in range(max_scrolls + 1):
+            items = self.page.locator('div.my-2')
+            cnt = await items.count()
+
+            for i in range(cnt):
+                el = items.nth(i)
+                try:
+                    txt = (await el.inner_text()).strip()
+                    if txt and txt not in all_opts_seen:
+                        all_opts_seen.append(txt)
+                    if txt == option_text:
+                        await el.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.2)
+                        await el.click()
+                        log.info(f"  ✔ 已选: {txt}（第 {scroll_idx} 次滚动后找到）")
+                        await asyncio.sleep(0.5)
+                        return
+                except Exception:
+                    continue
+
+            if scroll_idx >= max_scrolls:
+                break
+
+            log.info(f"  第 {scroll_idx + 1} 次滚动弹窗，已见 {len(all_opts_seen)} 个选项...")
+
+            if scroll_container and await scroll_container.count() > 0:
+                await scroll_container.evaluate(
+                    f"el => el.scrollBy(0, {scroll_step_px})"
+                )
+            else:
+                await self.page.evaluate(
+                    f"window.scrollBy(0, {scroll_step_px})"
+                )
+            await asyncio.sleep(0.4)
+
+            if scroll_container and await scroll_container.count() > 0:
+                at_bottom = await scroll_container.evaluate(
+                    "el => el.scrollTop + el.clientHeight >= el.scrollHeight - 5"
+                )
+                if at_bottom:
+                    log.info("  已滚到弹窗底部，未找到目标")
+                    break
+
+        log.error(f"  弹窗所有已见选项: {all_opts_seen}")
         raise RuntimeError(
-            f"弹窗找不到选项 {option_text!r}，实际选项: {all_opts}"
+            f"弹窗找不到选项 {option_text!r}，已见选项: {all_opts_seen}"
         )
 
     # ── 选图书馆 ──────────────────────────────────────────────────────────
