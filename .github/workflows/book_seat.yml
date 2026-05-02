@@ -1,9 +1,9 @@
 name: NLB Seat Auto-Booking
 
 on:
-  # 每天 10:00 SGT (= 02:00 UTC) 自动触发
+  # 每天 12:00 SGT (= 04:00 UTC) 自动触发
   schedule:
-    - cron: "0 2 * * *"
+    - cron: "0 4 * * *"
 
   # 也可在 Actions 页面手动触发（方便测试）
   workflow_dispatch:
