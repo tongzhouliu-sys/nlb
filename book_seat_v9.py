@@ -1,19 +1,13 @@
 """
-NLB Seat Booking Automation Script  (v10 — 座位优先级重构 + 稳定性修复)
+NLB Seat Booking Automation Script  (v9 — 座位图诊断 + Preferred Seat弹窗放宽)
 =========================================================================
-v10 新增：
-  1. 【优先级重构】Tier0(最优先4座, 可配置) → Tier1(S74-S86 + S1-S17) → Tier2(其他兜底)
-     座位图与 Preferred Seat 弹窗共用同一套 normalize + tier 逻辑（之前两处各写一套）
-  2. 【关键BUG修复】座位图路径之前不做座位号标准化，"74"/"Seat 74" 永远匹配
-     不上 "S74"，导致优先座位形同虚设、只能走兜底 —— 现统一 normalize_seat_id()
-  3. 【性能】座位属性改为 evaluate_all 单次批量读取（原来每元素 5+ 次 round-trip，
-     大座位图下耗时数分钟、容易触发 GitHub Actions 15min 超时）
-  4. 【稳定性】单时段失败自动重试（MAX_RETRIES_PER_SLOT=2，重试前回主页重置状态）
-  5. 【结果验证】CONFIRM 后扫描页面文案，命中错误关键词则抛错触发重试；
-     任一时段最终失败时以非零退出码结束，GitHub Actions 标红便于发现
-  6. 座位点击后校验 class 选中标记，未生效自动补点一次
+v9 新增（基于"上午AUTO"问题分析）：
+  1. 【座位图诊断】_pick_seat_by_priority 打印命中元素的全部属性（class/data-seat/
+     aria-label/inner_text），搞清楚 NLB 座位图用什么字段存座位 ID
+  2. 【Preferred Seat 弹窗放宽】_pick_preferred_seat_in_dialog 放弃严格 ^S[0-9]+$ 正则，
+     改为：打印弹窗所有原始文字，同时接受 "S74"/"74"/"Seat74" 等多种格式，
+     过滤掉明显非座位条目（图书馆名/时间/区域/Duration选项）
 
-v9 继承：座位图诊断日志、Preferred Seat 弹窗座位识别放宽（多格式 + 黑名单过滤）
 v8 继承修复：
   - _pick_dialog_radio 策略1 限定在 .v-dialog--active；scroll_into_view_if_needed timeout=3s
   - _pick_preferred_seat_in_dialog 限定在 .v-dialog--active
@@ -37,43 +31,12 @@ NLB_PASSWORD = os.environ["NLB_PASSWORD"]
 TARGET_LIBRARY = "Punggol Library"
 TARGET_AREA    = "Study Zone, Level 3"
 
-# 座位优先级（v10）：
-#   Tier 0：最优先的 4 个座位（按顺序尝试）——在下方列表填入具体座位号
-#   Tier 1：第一序列 = S74-S86 + S1-S17
-#   Tier 2：页面上其余可用座位（运行时动态补充，兜底）
-_TIER0 = []   # ← 填入最优先的 4 个座位，例如 ["S80", "S81", "S5", "S6"]
-_TIER1 = (
-    [f"S{n}" for n in range(74, 87)]   # S74 → S86
-    + [f"S{n}" for n in range(1, 18)]  # S1  → S17
-)
-_TIER1 = [s for s in _TIER1 if s not in _TIER0]   # 去重：Tier0 优先
-_KNOWN_SEATS = set(_TIER0) | set(_TIER1)
-# 其余座位（Tier 2）在运行时根据页面实际可用座位动态补充
-
-
-def normalize_seat_id(raw: str) -> str:
-    """
-    统一座位号格式："74" / "SEAT74" / "S-74" / "s74 " → "S74"
-    座位图和 Preferred Seat 弹窗共用，保证两条路径的匹配口径一致。
-    """
-    import re as _re
-    u = (raw or "").strip().upper().replace(" ", "")
-    m = _re.search(r'S?E?A?T?-?(\d+)', u)
-    if m and (u.isdigit() or u.startswith("S")):
-        return f"S{m.group(1)}"
-    return u
-
-
-def iter_priority_tiers(available_ids):
-    """
-    按优先级生成 (tier名称, 候选列表)。
-    available_ids: 当前可用座位号集合（已 normalize）。
-    """
-    avail = set(available_ids)
-    tier2 = [sid for sid in available_ids if sid not in _KNOWN_SEATS]
-    yield ("Tier0(最优先4座)",            [s for s in _TIER0 if s in avail])
-    yield ("Tier1(S74-S86,S1-S17)",       [s for s in _TIER1 if s in avail])
-    yield ("Tier2(其他座位)",             tier2)
+# 座位优先级：第一序列 S74-S86，第二序列 S1-S16，其余兜底
+_TIER1 = [f"S{n}" for n in range(74, 87)]    # S74 → S86
+_TIER2 = [f"S{n}" for n in range(1, 17)]     # S1  → S16
+_TIER3_EXCLUDE = set(_TIER1) | set(_TIER2)
+# _TIER3 在运行时根据页面实际可用座位动态补充（见 _pick_seat_by_priority）
+SEAT_CANDIDATES = _TIER1 + _TIER2            # 静态已知候选（_TIER3 动态追加）
 
 BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
@@ -845,34 +808,6 @@ class NLBBooker:
 
         await asyncio.sleep(1.5)
         await self.snap(f"15_confirmed_{label_safe}")
-        await self._verify_booking_result(label_safe)
-
-    async def _verify_booking_result(self, label_safe: str):
-        """
-        v10：CONFIRM 后检查页面结果。
-          - 命中错误关键词（fail/error/already booked/not available/limit）→ 抛错，
-            触发 main() 的单时段重试。
-          - 命中成功关键词 → 记录日志。
-          - 都没命中 → warn-only 放行（NLB 文案可能变化，不误杀）。
-        """
-        await asyncio.sleep(1.0)
-        try:
-            body_text = (await self.page.locator("body").inner_text()).lower()
-        except Exception:
-            return
-        err_words = ["unsuccessful", "failed", "error occurred", "already booked",
-                     "not available", "no longer available", "exceeded", "limit reached"]
-        ok_words  = ["success", "confirmed", "booking reference", "has been booked"]
-
-        hit_err = [w for w in err_words if w in body_text]
-        if hit_err:
-            await self.snap(f"ERR_result_{label_safe}")
-            raise RuntimeError(f"预约结果页含错误提示: {hit_err}")
-        hit_ok = [w for w in ok_words if w in body_text]
-        if hit_ok:
-            log.info(f"  ✅ 预约结果验证通过（命中: {hit_ok}）")
-        else:
-            log.warning("  ⚠ 结果页未见明确成功/失败文案，默认放行（请查截图 15_confirmed）")
 
     async def _pick_preferred_seat_in_dialog(self) -> str:
         """
@@ -985,16 +920,30 @@ class NLBBooker:
             log.warning("  ⚠ 未找到座位候选，保持 'No preferred seat'")
             return "AUTO"
 
-        # ── 按优先级选座（v10：与座位图共用 normalize + tier 逻辑）──────
-        normalized = {normalize_seat_id(k): v for k, v in available_in_dialog.items()}
+        # ── 按优先级选座 ─────────────────────────────────────────────────
+        # 标准化：把 "74" 映射成 "S74" 方便与 _TIER1/_TIER2 对比
+        def _normalize(k: str) -> str:
+            if _re.fullmatch(r'\d+', k):
+                return f"S{k}"
+            if k.startswith("SEAT"):
+                return "S" + k[4:]
+            return k
+
+        normalized = {_normalize(k): v for k, v in available_in_dialog.items()}
         log.info(f"  🪑 标准化后: {sorted(normalized.keys())}")
 
-        for tier_label, candidates in iter_priority_tiers(list(normalized.keys())):
+        tier3 = [sid for sid in normalized if sid not in _TIER3_EXCLUDE]
+        for tier_label, seats in [
+            ("第一序列(S74-S86)", _TIER1),
+            ("第二序列(S1-S16)",  _TIER2),
+            ("其他座位",          tier3),
+        ]:
+            candidates = [s for s in seats if s in normalized]
             log.info(f"  🔍 弹窗尝试 {tier_label}，候选: {candidates}")
             for seat_id in candidates:
                 el = normalized[seat_id]
                 try:
-                    await el.scroll_into_view_if_needed(timeout=5_000)
+                    await el.scroll_into_view_if_needed()
                     await asyncio.sleep(0.3)
                     await el.click()
                     log.info(f"  ✅ Preferred Seat 弹窗已选: {seat_id}（{tier_label}）")
@@ -1024,21 +973,21 @@ class NLBBooker:
     # ── 按优先级选座 ──────────────────────────────────────────────────────
     async def _pick_seat_by_priority(self, label_safe: str) -> str:
         """
-        座位优先级（v10）：Tier0(最优先4座) → Tier1(S74-S86, S1-S17) → Tier2(其他)
+        座位优先级：
+          第一序列 S74-S86 → 第二序列 S1-S16 → 其他可用座位（兜底）
 
-        v10 修复：
-          1. 【关键BUG】收集到的座位号现在统一 normalize_seat_id()，
-             之前 "74"/"Seat 74" 等格式永远匹配不上 "S74"，导致只能走兜底。
-          2. 属性读取改为单次 evaluate_all 批量获取，原来每个元素 5+ 次
-             round-trip，大座位图下耗时数分钟、易超时。
-          3. 点击后校验 class 是否变为 selected/active（warn-only），
-             点击未生效时自动重试一次。
+        关键修复：座位列表需要滚动，不能用 is_visible() 过滤，
+        收集阶段只排除明确禁用的座位，点击前统一 scroll_into_view_if_needed()。
 
-        返回实际选中的座位号；若无任何可用座位则返回 "AUTO"。
+        返回实际选中的座位号；若无任何可用座位则抛出 RuntimeError。
         """
         # ── 收集页面上所有可用（未禁用）座位元素 ────────────────────────
         async def _get_available_seats() -> dict[str, object]:
-            """返回 {normalize后座位号: locator}。批量读属性，单次 round-trip。"""
+            """
+            返回 {座位号: locator} 的字典。
+            不做 is_visible() 过滤——视口外的座位同样需要被发现。
+            v9 新增：打印每个命中元素的全部属性，用于诊断 NLB 座位图的 DOM 结构。
+            """
             available: dict[str, object] = {}
             for sel in [
                 '[class*="seat"]:not([class*="disabled"]):not([class*="unavailable"])',
@@ -1051,36 +1000,36 @@ class NLBBooker:
                 if cnt == 0:
                     continue
                 log.info(f"  🔎 selector={sel!r} 匹配到 {cnt} 个元素")
-
-                # 一次性批量读取所有元素的关键属性（v10：替代逐元素 evaluate）
-                try:
-                    infos = await els.evaluate_all(
-                        """els => els.map(e => ({
-                            tag:  e.tagName,
-                            cls:  e.getAttribute('class') || '',
-                            ds:   e.getAttribute('data-seat') || '',
-                            aria: e.getAttribute('aria-label') || '',
-                            txt:  (e.innerText || '').trim(),
-                        }))"""
-                    )
-                except Exception as e:
-                    log.warning(f"  ⚠ 批量读取属性失败: {e}")
-                    continue
-
-                for i, info in enumerate(infos):
-                    raw = info["ds"] or info["aria"] or info["txt"]
-                    if not raw:
-                        continue
-                    seat_id = normalize_seat_id(raw)
-                    cls_low = info["cls"].lower()
-                    if any(k in cls_low for k in ("disabled", "unavailable", "booked", "occupied", "selected")):
-                        continue
-                    if seat_id not in available:
-                        available[seat_id] = els.nth(i)
-                        log.info(
-                            f"  📍 元素#{i}: <{info['tag']}> {seat_id} "
-                            f"(raw={raw!r} class={info['cls']!r})"
+                for i in range(cnt):
+                    el = els.nth(i)
+                    try:
+                        # ── 诊断：打印元素所有属性，帮助识别座位 ID 字段 ──
+                        tag      = await el.evaluate("e => e.tagName")
+                        cls_val  = await el.get_attribute("class") or ""
+                        ds       = await el.get_attribute("data-seat") or ""
+                        aria     = await el.get_attribute("aria-label") or ""
+                        txt      = (await el.inner_text()).strip()
+                        all_attrs = await el.evaluate(
+                            "e => Object.fromEntries([...e.attributes].map(a=>[a.name,a.value]))"
                         )
+                        log.info(
+                            f"  📍 元素#{i}: <{tag}> class={cls_val!r} "
+                            f"data-seat={ds!r} aria-label={aria!r} text={txt!r} "
+                            f"all_attrs={all_attrs}"
+                        )
+                        # 获取座位号：优先 data-seat，其次 aria-label，最后 inner_text
+                        seat_id = ds or aria or txt
+                        if not seat_id:
+                            log.info(f"  ⚠ 元素#{i}: 无法读取座位号，跳过")
+                            continue
+                        seat_id = seat_id.strip().upper()
+                        if any(k in cls_val.lower() for k in ("disabled", "unavailable", "booked", "occupied")):
+                            log.info(f"  ⚠ 元素#{i} {seat_id}: class 含禁用标记，跳过")
+                            continue
+                        available[seat_id] = el
+                    except Exception as e:
+                        log.warning(f"  ⚠ 元素#{i} 处理异常: {e}")
+                        continue
                 if available:
                     break
             return available
@@ -1092,45 +1041,40 @@ class NLBBooker:
             log.warning("  ⚠ 未检测到可用座位，尝试直接进入预约详情页（系统自动分配）")
             return "AUTO"
 
-        # ── 按优先级逐个尝试 ────────────────────────────────────────────
-        for tier_label, candidates in iter_priority_tiers(list(available.keys())):
-            log.info(f"  🔍 尝试 {tier_label}，候选: {candidates}")
-            for seat_id in candidates:
+        # ── 按优先级构造候选序列 ─────────────────────────────────────────
+        # Tier 3：页面上有但不在 Tier1/Tier2 的座位，保持页面顺序
+        tier3 = [sid for sid in available if sid not in _TIER3_EXCLUDE]
+
+        # ── 逐个尝试 ────────────────────────────────────────────────────
+        for tier_label, seats in [
+            ("第一序列(S74-S86)", _TIER1),
+            ("第二序列(S1-S16)",  _TIER2),
+            ("其他座位",          tier3),
+        ]:
+            log.info(f"  🔍 尝试 {tier_label}，候选: {[s for s in seats if s in available]}")
+            for seat_id in seats:
+                if seat_id not in available:
+                    continue
                 el = available[seat_id]
-                for attempt in (1, 2):   # 点击未生效时自动重试一次
-                    try:
-                        await el.scroll_into_view_if_needed(timeout=5_000)
-                        await asyncio.sleep(0.3)
-                        await el.click()
-                        await asyncio.sleep(0.5)
-                        # 校验点击是否生效（warn-only：class 出现 selected/active）
-                        try:
-                            cls_after = (await el.get_attribute("class")) or ""
-                            if any(k in cls_after.lower() for k in ("selected", "active", "chosen")):
-                                log.info(f"  ✔ 点击已生效（class={cls_after!r}）")
-                            elif attempt == 1:
-                                log.warning(f"  ⚠ class 未见选中标记（{cls_after!r}），重试点击...")
-                                continue
-                        except Exception:
-                            pass
-                        log.info(f"  ✅ 已选座位: {seat_id}（{tier_label}）")
-                        await asyncio.sleep(0.3)
-                        await self.snap(f"seat_selected_{seat_id}_{label_safe}")
-                        return seat_id
-                    except Exception as e:
-                        log.warning(f"  ⚠ 点击 {seat_id} 失败(attempt {attempt}): {e}")
-                        break   # 元素本身点不动，换下一个座位
+                try:
+                    # 先滚动到视口（座位可能在屏幕外），再等动画，再点击
+                    await el.scroll_into_view_if_needed()
+                    await asyncio.sleep(0.3)
+                    await el.click()
+                    log.info(f"  ✅ 已选座位: {seat_id}（{tier_label}）")
+                    await asyncio.sleep(0.8)
+                    await self.snap(f"seat_selected_{seat_id}_{label_safe}")
+                    return seat_id
+                except Exception as e:
+                    log.warning(f"  ⚠ 点击 {seat_id} 失败: {e}，继续下一个")
+                    continue
 
         raise RuntimeError("所有优先级座位均不可用，预约失败")
 
 
 # ═════════════════════════════════════════════════════════════════════════
-MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
-
-
 async def main():
-    log.info(f"=== NLB v10 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
-    log.info(f"座位优先级 Tier0: {_TIER0 or '(未配置)'}  Tier1: {_TIER1[0]}…{_TIER1[-1]} 共{len(_TIER1)}个")
+    log.info(f"=== NLB v6 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
@@ -1155,24 +1099,13 @@ async def main():
 
             results = []
             for label, time_str, dur_str in TIME_SLOTS:
-                # v10：单时段失败自动重试（页面状态可能残留，先回主页再重来）
-                last_err = None
-                for attempt in range(1, MAX_RETRIES_PER_SLOT + 1):
-                    try:
-                        if attempt > 1:
-                            log.warning(f"🔁 {label} 第 {attempt} 次尝试（共{MAX_RETRIES_PER_SLOT}次）...")
-                            await page.goto(BASE_URL, wait_until="load")
-                            await asyncio.sleep(2)
-                        seat = await booker.book_one_slot(label, time_str, dur_str)
-                        results.append((label, f"✅ 成功  区域: {seat}"))
-                        last_err = None
-                        break
-                    except Exception as e:
-                        last_err = e
-                        log.error(f"❌ {label} 第 {attempt} 次失败: {e}")
-                        await booker.snap(f"ERR_{_safe(label)}_attempt{attempt}")
-                if last_err is not None:
-                    results.append((label, f"❌ 失败: {last_err}"))
+                try:
+                    seat = await booker.book_one_slot(label, time_str, dur_str)
+                    results.append((label, f"✅ 成功  区域: {seat}"))
+                except Exception as e:
+                    log.error(f"❌ {label} 失败: {e}")
+                    await booker.snap(f"ERR_{_safe(label)}")
+                    results.append((label, f"❌ 失败: {e}"))
                 await asyncio.sleep(3)
 
             log.info("\n" + "=" * 60)
@@ -1180,10 +1113,6 @@ async def main():
             for label, status in results:
                 log.info(f"  {label}  →  {status}")
             log.info("=" * 60)
-
-            # 任一时段最终失败 → 非零退出码，让 GitHub Actions 标红便于发现
-            if any(status.startswith("❌") for _, status in results):
-                raise SystemExit(1)
 
         finally:
             await browser.close()
