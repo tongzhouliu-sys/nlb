@@ -1,25 +1,21 @@
 """
-NLB Seat Booking Automation Script  (v10 — 座位优先级重构 + 稳定性修复)
+NLB Seat Booking Automation Script  (v11 — 假成功修复：终极校验 Bookings 列表)
 =========================================================================
-v10 新增：
-  1. 【优先级重构】Tier0(最优先4座, 可配置) → Tier1(S74-S86 + S1-S17) → Tier2(其他兜底)
-     座位图与 Preferred Seat 弹窗共用同一套 normalize + tier 逻辑（之前两处各写一套）
-  2. 【关键BUG修复】座位图路径之前不做座位号标准化，"74"/"Seat 74" 永远匹配
-     不上 "S74"，导致优先座位形同虚设、只能走兜底 —— 现统一 normalize_seat_id()
-  3. 【性能】座位属性改为 evaluate_all 单次批量读取（原来每元素 5+ 次 round-trip，
-     大座位图下耗时数分钟、容易触发 GitHub Actions 15min 超时）
-  4. 【稳定性】单时段失败自动重试（MAX_RETRIES_PER_SLOT=2，重试前回主页重置状态）
-  5. 【结果验证】CONFIRM 后扫描页面文案，命中错误关键词则抛错触发重试；
-     任一时段最终失败时以非零退出码结束，GitHub Actions 标红便于发现
-  6. 座位点击后校验 class 选中标记，未生效自动补点一次
+v11 新增（针对"Actions 显示成功但实际没预约上"）：
+  1. 【BOOK按钮误点修复】:has-text("BOOK") 是大小写不敏感的子串匹配，
+     会误中底部导航 "Bookings" Tab → 改为 ^BOOK$ 整词精确匹配
+  2. 【终极校验】每个时段流程跑完后，打开 Bookings 列表页，
+     核对目标日期+时段真实存在；不存在 → 判失败 → 触发重试 → 最终标红
+  3. Preferred Seat 弹窗未出现的分支补上结果校验（之前该路径零校验）
+  4. _click_confirm_dialog 找不到确认按钮时不再静默跳过，截图+大声警告
+  ⇒ 现在 "✅ 成功(已核实)" = Bookings 列表里真的查到了这条预约
 
-v9 继承：座位图诊断日志、Preferred Seat 弹窗座位识别放宽（多格式 + 黑名单过滤）
-v8 继承修复：
-  - _pick_dialog_radio 策略1 限定在 .v-dialog--active；scroll_into_view_if_needed timeout=3s
-  - _pick_preferred_seat_in_dialog 限定在 .v-dialog--active
-  - div.my-2 全局选择器改成弹窗内相对查找
-  - _verify_form_fields 改为 warn-only
-  - Duration 候选 "1:30" 调到第一位
+v10 继承：
+  - Tier0(S74,S86,S1,S17) → Tier1(S74-S86,S1-S17) → Tier2 兜底；
+    座位图与弹窗共用 normalize_seat_id + iter_priority_tiers
+  - 座位号标准化修复（"74"≠"S74" 的匹配 bug）、evaluate_all 批量读属性
+  - 单时段失败自动重试、失败时非零退出码
+v8/v9 继承：弹窗限定 .v-dialog--active、座位识别放宽、Duration 候选等
 """
 
 import os
@@ -715,7 +711,7 @@ class NLBBooker:
         await self.navigate_to_new_booking()
         await self.select_library()
         await self.select_area()
-        await self.select_date()
+        self._last_target_date = await self.select_date()   # v11：记录目标日期供终极校验用
         await self.select_time(time_str)
         await self.select_duration(dur_candidates)
 
@@ -771,14 +767,19 @@ class NLBBooker:
         log.info(f"  🪑 最终选座: {booked_seat}")
 
         # 等 Booking Details 页面 + BOOK 按钮
-        await self.page.wait_for_selector(
-            'button:has-text("BOOK")', timeout=15_000
-        )
+        # v11 修复：:has-text("BOOK") 是大小写不敏感的【子串】匹配，
+        # 会误中底部导航的 "Bookings" Tab —— 改为整词精确匹配
+        import re as _re
+        _book_exact = _re.compile(r'^\s*BOOK\s*$', _re.IGNORECASE)
+        book_btn = self.page.locator('button, [role="button"], .v-btn').filter(
+            has_text=_book_exact
+        ).first
+        await book_btn.wait_for(state="visible", timeout=15_000)
         await self.snap(f"13_booking_details_{s}")
         log.info("  📄 已进入 Booking Details 页")
 
         # 点 BOOK 按钮
-        await self.page.locator('button:has-text("BOOK")').first.click()
+        await book_btn.click()
         log.info("  ✔ 已点击 BOOK 按钮")
         await asyncio.sleep(1.5)
         await self.snap(f"14_after_book_{s}")
@@ -808,6 +809,8 @@ class NLBBooker:
         except PlaywrightTimeout:
             log.info("  ℹ Preferred Seat 弹窗未出现，检查其他确认弹窗...")
             await self._click_confirm_dialog(label_safe)
+            # v11：这条路径之前没有任何结果校验，是假成功的主要漏洞之一
+            await self._verify_booking_result(label_safe)
             return
 
         await self.snap(f"14b_preferred_seat_dialog_{label_safe}")
@@ -853,7 +856,7 @@ class NLBBooker:
           - 命中错误关键词（fail/error/already booked/not available/limit）→ 抛错，
             触发 main() 的单时段重试。
           - 命中成功关键词 → 记录日志。
-          - 都没命中 → warn-only 放行（NLB 文案可能变化，不误杀）。
+          - 都没命中 → warn-only 放行（最终以 verify_booking_exists 为准）。
         """
         await asyncio.sleep(1.0)
         try:
@@ -872,7 +875,61 @@ class NLBBooker:
         if hit_ok:
             log.info(f"  ✅ 预约结果验证通过（命中: {hit_ok}）")
         else:
-            log.warning("  ⚠ 结果页未见明确成功/失败文案，默认放行（请查截图 15_confirmed）")
+            log.warning("  ⚠ 结果页未见明确成功/失败文案（最终以 Bookings 列表核实为准）")
+
+    # ── 终极校验：去 Bookings 列表核实预约真实存在（v11）──────────────────
+    async def verify_booking_exists(self, time_str: str, label_safe: str) -> bool:
+        """
+        打开底部导航 Bookings Tab，读取列表页全文，
+        同时核对【目标日期】和【时段】是否出现。
+        这是判定成功的最终标准——杜绝"流程跑完但实际没订上"的假成功。
+        """
+        log.info("▶ 终极校验：核实 Bookings 列表...")
+        try:
+            await self.page.goto(BASE_URL, wait_until="load")
+            await asyncio.sleep(2)
+            tab = self.page.locator(
+                '.v-btn__content:has-text("Booking"), '
+                'span:has-text("Booking"), button:has-text("Booking")'
+            ).first
+            await tab.wait_for(state="visible", timeout=10_000)
+            await tab.click()
+            try:
+                await self.page.wait_for_load_state("load", timeout=15_000)
+            except PlaywrightTimeout:
+                pass
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.warning(f"  ⚠ 打开 Bookings 列表失败: {e}")
+            await self.snap(f"ERR_open_bookings_{label_safe}")
+            return False
+
+        await self.snap(f"16_my_bookings_{label_safe}")
+
+        try:
+            body = await self.page.locator("body").inner_text()
+        except Exception:
+            return False
+        body_l = body.lower()
+
+        # 日期匹配：兼容 "13 Jun" / "13 June" / "Jun 13" / "13/06/2026" / "2026-06-13"
+        t = self._last_target_date
+        date_variants = [
+            f"{t.day} {t.strftime('%b')}",  f"{t.day:02d} {t.strftime('%b')}",
+            f"{t.day} {t.strftime('%B')}",  f"{t.strftime('%b')} {t.day}",
+            f"{t.strftime('%B')} {t.day}",
+            t.strftime("%d/%m/%Y"),         t.strftime("%Y-%m-%d"),
+        ]
+        has_date = any(v.lower() in body_l for v in date_variants)
+
+        # 时段匹配："10:00 am" → "10:00" / "10.00" / "10:00am"
+        hm = time_str.split()[0]            # "10:00"
+        has_time = (hm in body) or (hm.replace(":", ".") in body) \
+                   or (time_str.replace(" ", "").lower() in body_l.replace(" ", ""))
+
+        log.info(f"  📋 Bookings 列表核对: 日期命中={has_date} 时段命中={has_time} "
+                 f"(目标 {t.strftime('%d %b %Y')} {time_str})")
+        return has_date and has_time
 
     async def _pick_preferred_seat_in_dialog(self) -> str:
         """
@@ -1009,17 +1066,23 @@ class NLBBooker:
 
     async def _click_confirm_dialog(self, label_safe: str):
         """处理普通确认弹窗（OK / Confirm / Yes / CONFIRM）"""
+        clicked = False
         for word in ["OK", "Confirm", "Yes", "CONFIRM"]:
             try:
                 btn = self.page.get_by_text(word, exact=True).first
                 await btn.wait_for(state="visible", timeout=4_000)
                 await btn.click()
                 log.info(f"  ✔ 确认弹窗: {word}")
+                clicked = True
                 await asyncio.sleep(1.5)
                 await self.snap(f"15_confirmed_{label_safe}")
                 break
             except PlaywrightTimeout:
                 continue
+        if not clicked:
+            # v11：之前这里静默跳过，是假成功的隐患之一
+            log.warning("  ⚠ 未找到任何确认按钮（OK/Confirm/Yes），可能根本没触发预约提交！")
+            await self.snap(f"WARN_no_confirm_btn_{label_safe}")
 
     # ── 按优先级选座 ──────────────────────────────────────────────────────
     async def _pick_seat_by_priority(self, label_safe: str) -> str:
@@ -1164,7 +1227,15 @@ async def main():
                             await page.goto(BASE_URL, wait_until="load")
                             await asyncio.sleep(2)
                         seat = await booker.book_one_slot(label, time_str, dur_str)
-                        results.append((label, f"✅ 成功  区域: {seat}"))
+
+                        # v11 终极校验：Bookings 列表里必须真的有这条预约
+                        verified = await booker.verify_booking_exists(time_str, _safe(label))
+                        if not verified:
+                            raise RuntimeError(
+                                "流程跑完但 Bookings 列表未找到该预约（假成功），"
+                                "请查截图 16_my_bookings"
+                            )
+                        results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
                         last_err = None
                         break
                     except Exception as e:
