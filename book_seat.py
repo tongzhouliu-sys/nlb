@@ -68,8 +68,8 @@ BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
 # Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
 TIME_SLOTS = [
-    ("10:00–11:30", "10:00 am", ["1:30", "1 hour 30 mins", "90 mins", "1.5 hours", "1 hr 30 min"]),
-    ("14:00–15:30", "2:00 pm",  ["1:30", "1 hour 30 mins", "90 mins", "1.5 hours", "1 hr 30 min"]),
+    ("10:00–11:30", "10:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1:30", "1 hour 30 mins", "90 mins", "1.5 hours", "1 hr 30 min"]),
+    ("14:00–15:30", "2:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1:30", "1 hour 30 mins", "90 mins", "1.5 hours", "1 hr 30 min"]),
 ]
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
