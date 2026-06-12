@@ -1,21 +1,24 @@
 """
-NLB Seat Booking Automation Script  (v11 — 假成功修复：终极校验 Bookings 列表)
+NLB Seat Booking Automation Script  (v12 — 依据实机截图重写选座流程)
 =========================================================================
-v11 新增（针对"Actions 显示成功但实际没预约上"）：
-  1. 【BOOK按钮误点修复】:has-text("BOOK") 是大小写不敏感的子串匹配，
-     会误中底部导航 "Bookings" Tab → 改为 ^BOOK$ 整词精确匹配
-  2. 【终极校验】每个时段流程跑完后，打开 Bookings 列表页，
-     核对目标日期+时段真实存在；不存在 → 判失败 → 触发重试 → 最终标红
-  3. Preferred Seat 弹窗未出现的分支补上结果校验（之前该路径零校验）
-  4. _click_confirm_dialog 找不到确认按钮时不再静默跳过，截图+大声警告
-  ⇒ 现在 "✅ 成功(已核实)" = Bookings 列表里真的查到了这条预约
+v12 核心修正（基于真实手机截图，纠正了对 NLB UI 的两个错误认知）：
+  1. 【真实流程】区域卡片 → 直接进 Booking Details（没有座位图页！）
+     → 点 BOOK → "Selection" 对话框 → 必须先点 "Select seat" 输入框
+     → 弹出 "Seat" 单选列表（Any available seat / S3 / S7...，可滚动）
+     → 点圆圈选中 → 回 Selection 框等 CONFIRM 由灰变蓝 → 点击
+     之前脚本在等永远不会出现的 "Preferred Seat" 文字 → 假成功根因
+  2. 【12:00pm 误订修复】_pick_dialog_radio 的 :has-text() 是子串匹配，
+     "12:00 pm" 包含 "2:00 pm" → 下午时段被订成中午！改为 ^...$ 精确匹配
+  3. 【BOOK 前核对】Booking Details 页核对日期+起始时段，不符即抛错重试
+     （结束时间不符仅警告——Duration 没选上 1.5h 时能从日志看出来）
+  4. 选座兜底：优先序列都不在列表 → 选 "Any available seat"（用户指定）
+  5. CONFIRM 必须确认已脱离禁用态才点击，仍禁用则抛错（选座未生效）
+  6. 移除基于错误 UI 认知的死代码（座位图扫描、Preferred Seat 弹窗处理）
 
-v10 继承：
-  - Tier0(S74,S86,S1,S17) → Tier1(S74-S86,S1-S17) → Tier2 兜底；
-    座位图与弹窗共用 normalize_seat_id + iter_priority_tiers
-  - 座位号标准化修复（"74"≠"S74" 的匹配 bug）、evaluate_all 批量读属性
-  - 单时段失败自动重试、失败时非零退出码
-v8/v9 继承：弹窗限定 .v-dialog--active、座位识别放宽、Duration 候选等
+v11 继承：^BOOK$ 防误中 Bookings 导航；终极校验 verify_booking_exists
+          （Bookings 列表查到真实预约才算成功）；失败非零退出码标红
+v10 继承：Tier0(S74,S86,S1,S17) → Tier1(S74-S86,S1-S17)；normalize_seat_id；
+          单时段自动重试
 """
 
 import os
@@ -59,17 +62,6 @@ def normalize_seat_id(raw: str) -> str:
         return f"S{m.group(1)}"
     return u
 
-
-def iter_priority_tiers(available_ids):
-    """
-    按优先级生成 (tier名称, 候选列表)。
-    available_ids: 当前可用座位号集合（已 normalize）。
-    """
-    avail = set(available_ids)
-    tier2 = [sid for sid in available_ids if sid not in _KNOWN_SEATS]
-    yield ("Tier0(最优先4座)",            [s for s in _TIER0 if s in avail])
-    yield ("Tier1(S74-S86,S1-S17)",       [s for s in _TIER1 if s in avail])
-    yield ("Tier2(其他座位)",             tier2)
 
 BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
@@ -578,19 +570,18 @@ class NLBBooker:
             log.info("  弹窗容器（兜底）: 最后一个 .v-dialog")
 
         # 策略1：在活跃弹窗内用 label/radio 选择器，3s 短超时快速失败
-        for rel_sel in [
-            f'label:has-text("{option_text}")',
-            f'.v-radio:has-text("{option_text}")',
-            f'[role="radio"]:has-text("{option_text}")',
-            f'.v-list-item:has-text("{option_text}")',
-        ]:
+        # v12 修复：:has-text() 是子串匹配，"12:00 pm" 会命中 "2:00 pm"！
+        # 改为 ^...$ 整词精确匹配（这就是下午时段被订成 12:00 pm 的根因）
+        import re as _re
+        _exact = _re.compile(rf'^\s*{_re.escape(option_text)}\s*$', _re.IGNORECASE)
+        for base_sel in ['label', '.v-radio', '[role="radio"]', '.v-list-item']:
             try:
-                el = dialog_root.locator(rel_sel).first
+                el = dialog_root.locator(base_sel).filter(has_text=_exact).first
                 if await el.count() > 0:
                     await el.scroll_into_view_if_needed(timeout=3_000)
                     await asyncio.sleep(0.2)
                     await el.click()
-                    log.info(f"  ✔ 已选: {option_text}（{rel_sel}）")
+                    log.info(f"  ✔ 已选(精确): {option_text}（{base_sel}）")
                     await asyncio.sleep(0.5)
                     return
             except Exception:
@@ -720,16 +711,19 @@ class NLBBooker:
 
         await self.check_available_slots()
 
-        await self._click_area_and_book(label)
+        await self._click_area_and_book(label, time_str)
         log.info(f"🎉 {label} 预约完成！")
         return TARGET_AREA
     # ── 点击区域结果卡片并完成预约 ──────────────────────────────────────
-    async def _click_area_and_book(self, label: str):
+    async def _click_area_and_book(self, label: str, time_str: str):
         """
-        Search Results 页：点击 TARGET_AREA 对应的卡片
-        → Seat Selection 页：按优先级选座（第一序列 S74-S86，第二序列 S1-S16，其他）
-        → Booking Details 页：点 BOOK 按钮
-        → 处理确认弹窗
+        真实流程（v12，依据实机截图修正）：
+          Search Results 页点 TARGET_AREA 卡片
+          → 直接进入 Booking Details 页（没有座位图页！）
+          → 核对页面显示的日期/时段（防止 Time/Duration 选择悄悄失效）
+          → 点 BOOK → 弹 "Selection" 对话框（含 "Select seat" 输入框）
+          → 点 "Select seat" → 弹 "Seat" 单选列表 → 按优先级选座
+          → 回 Selection 框点 CONFIRM（选座后才会从灰色变可点）
         """
         s = _safe(label)
         await asyncio.sleep(1.5)
@@ -760,15 +754,8 @@ class NLBBooker:
             log.info(f"  ✔ 点击区域卡片（兜底）: {TARGET_AREA}")
 
         await asyncio.sleep(1.0)
-        await self.snap(f"12_seat_selection_{s}")
 
-        # ── 按优先级选座 ──────────────────────────────────────────────
-        booked_seat = await self._pick_seat_by_priority(s)
-        log.info(f"  🪑 最终选座: {booked_seat}")
-
-        # 等 Booking Details 页面 + BOOK 按钮
-        # v11 修复：:has-text("BOOK") 是大小写不敏感的【子串】匹配，
-        # 会误中底部导航的 "Bookings" Tab —— 改为整词精确匹配
+        # 等 Booking Details 页面 + BOOK 按钮（^BOOK$ 整词，防误中 Bookings 导航）
         import re as _re
         _book_exact = _re.compile(r'^\s*BOOK\s*$', _re.IGNORECASE)
         book_btn = self.page.locator('button, [role="button"], .v-btn').filter(
@@ -778,77 +765,232 @@ class NLBBooker:
         await self.snap(f"13_booking_details_{s}")
         log.info("  📄 已进入 Booking Details 页")
 
+        # ── v12：点 BOOK 前核对页面显示的日期与时段 ──────────────────────
+        await self._verify_booking_details(label, time_str)
+
         # 点 BOOK 按钮
         await book_btn.click()
         log.info("  ✔ 已点击 BOOK 按钮")
         await asyncio.sleep(1.5)
         await self.snap(f"14_after_book_{s}")
 
-        # ── 处理 "Preferred Seat" 弹窗 ────────────────────────────────────
-        # 点击 BOOK 后会弹出 "Preferred Seat" 对话框，
-        # 默认选中 "No preferred seat"（系统分配），
-        # 需要往下滚动选择具体座位，然后点 CONFIRM
-        await self._handle_preferred_seat_dialog(s)
+        # ── 处理 "Selection" 选座对话框 ──────────────────────────────────
+        await self._handle_selection_dialog(s)
 
-    # ── 处理 "Preferred Seat" 弹窗 ──────────────────────────────────────────
-    async def _handle_preferred_seat_dialog(self, label_safe: str):
+    # ── 点 BOOK 前核对 Booking Details（v12）────────────────────────────
+    async def _verify_booking_details(self, label: str, time_str: str):
         """
-        点击 BOOK 后出现的 "Preferred Seat" 弹窗处理：
-          - 弹窗默认选中 "No preferred seat"（系统分配）
-          - 需要往下滚动，按优先级选择具体座位（S74-S86 → S1-S16 → 其他）
-          - 选好后点 CONFIRM 确认
+        核对 Booking Details 页文字：
+          - 起始时间（如 "10:00 am"）必须出现，否则说明 Time 选择失效
+            （实测曾被订成 12:00 pm，因 :has-text 子串匹配 bug）→ 抛错触发重试
+          - 结束时间（label 里的 "11:30" 等）未出现 → 仅警告（Duration 可能不支持）
+          - 目标日期未出现 → 抛错
+        """
+        body = await self.page.locator("body").inner_text()
+        body_l = body.lower()
 
-        若弹窗未出现（某些时段直接跳过），则检查是否已有其他确认弹窗。
-        """
-        # 等待 "Preferred Seat" 弹窗出现
-        try:
-            await self.page.wait_for_selector(
-                'text="Preferred Seat"', timeout=6_000
+        t = self._last_target_date
+        date_ok = any(v.lower() in body_l for v in [
+            f"{t.day} {t.strftime('%b')}", f"{t.day:02d} {t.strftime('%b')}",
+            f"{t.day} {t.strftime('%B')}", f"{t.strftime('%B')} {t.day}",
+        ])
+        if not date_ok:
+            raise RuntimeError(f"Booking Details 日期不符（期望 {t.strftime('%d %b %Y')}），中止本次")
+
+        if time_str.lower() not in body_l:
+            raise RuntimeError(
+                f"Booking Details 起始时间不符（期望 {time_str!r}），"
+                f"Time 选择可能失效，中止本次以触发重试"
             )
-            log.info("  📋 检测到 Preferred Seat 弹窗")
+
+        # 结束时间：label 形如 "10:00–11:30"，取 "–" 后半段
+        end_hm = label.split("–")[-1].strip() if "–" in label else None
+        if end_hm:
+            # "11:30" / "15:30"→"3:30" 两种写法都试
+            h, m = end_hm.split(":")
+            variants = {end_hm, f"{int(h) % 12 or 12}:{m}"}
+            if not any(v in body for v in variants):
+                log.warning(f"  ⚠ Booking Details 结束时间未见 {variants}（Duration 可能没选上 1.5h，请查截图 13）")
+
+        log.info(f"  ✅ Booking Details 核对通过: {t.strftime('%d %b')} {time_str}")
+
+    # ── 处理 "Selection" 选座对话框（v12，依据实机截图重写）────────────
+    async def _handle_selection_dialog(self, label_safe: str):
+        """
+        点 BOOK 后弹出 "Selection" 对话框：
+          1. 必须先点 "Select seat" 输入框 → 才会弹出 "Seat" 单选列表
+          2. "Seat" 列表可滚动，选项形如 Any available seat / S3 / S7 / S14...
+             点中圆圈即自动选中（列表随之关闭）
+          3. 优先级座位都不在列表里 → 选最上面的 "Any available seat"
+          4. 回到 Selection 框，CONFIRM 由灰变蓝后点击
+        """
+        # 等 Selection 对话框出现
+        try:
+            await self.page.wait_for_selector('text="Select seat"', timeout=8_000)
+            log.info("  📋 检测到 Selection 对话框（Select seat 字段）")
         except PlaywrightTimeout:
-            log.info("  ℹ Preferred Seat 弹窗未出现，检查其他确认弹窗...")
+            log.warning("  ⚠ 未见 Selection 对话框，检查其他确认弹窗...")
             await self._click_confirm_dialog(label_safe)
-            # v11：这条路径之前没有任何结果校验，是假成功的主要漏洞之一
             await self._verify_booking_result(label_safe)
             return
 
-        await self.snap(f"14b_preferred_seat_dialog_{label_safe}")
+        await self.snap(f"14b_selection_dialog_{label_safe}")
 
-        # 弹窗内的座位列表：收集所有可点击的座位选项（跳过 "No preferred seat"）
-        # 选项通常是 radio label 或 div.my-2 格式，文字形如 "S74", "S1" 等
-        preferred_seat = await self._pick_preferred_seat_in_dialog()
-        log.info(f"  🪑 Preferred Seat 弹窗选座: {preferred_seat}")
-
-        await self.snap(f"14c_preferred_seat_selected_{label_safe}")
-
-        # 点 CONFIRM 确认
-        confirm_btn = None
+        # 步骤1：点击 "Select seat" 字段，打开 Seat 单选列表
+        opened = False
         for sel in [
-            'button:has-text("CONFIRM")',
-            'button:has-text("Confirm")',
-            '[role="button"]:has-text("CONFIRM")',
+            'text="Select seat"',
+            '.v-dialog--active .v-select',
+            '.v-dialog--active .v-text-field',
+            '.v-dialog--active input',
         ]:
             try:
-                btn = self.page.locator(sel).first
-                if await btn.count() > 0:
-                    await btn.wait_for(state="visible", timeout=5_000)
-                    confirm_btn = btn
+                el = self.page.locator(sel).first
+                if await el.count() > 0:
+                    await el.click()
+                    # Seat 列表的标志：出现 "Any available seat"
+                    await self.page.wait_for_selector(
+                        'text="Any available seat"', timeout=5_000
+                    )
+                    opened = True
+                    log.info(f"  ✔ 已打开 Seat 单选列表（{sel}）")
                     break
             except Exception:
                 continue
+        if not opened:
+            await self.snap(f"ERR_seat_list_not_open_{label_safe}")
+            raise RuntimeError("点击 Select seat 后未弹出 Seat 列表，请查截图")
 
-        if confirm_btn:
-            await confirm_btn.click()
-            log.info("  ✔ Preferred Seat 弹窗：已点击 CONFIRM")
-        else:
-            # 兜底：文字匹配
-            await self.page.get_by_text("CONFIRM", exact=True).first.click()
-            log.info("  ✔ Preferred Seat 弹窗：已点击 CONFIRM（兜底）")
+        await self.snap(f"14c_seat_list_{label_safe}")
 
+        # 步骤2：在 Seat 列表中按优先级选座
+        chosen = await self._pick_seat_in_seat_dialog()
+        log.info(f"  🪑 Seat 列表已选: {chosen}")
+        await asyncio.sleep(0.8)
+        await self.snap(f"14d_seat_chosen_{label_safe}")
+
+        # 步骤3：等 CONFIRM 由禁用变可点，然后点击
+        import re as _re
+        confirm = self.page.locator(
+            '.v-dialog--active button, .v-dialog--active .v-btn'
+        ).filter(has_text=_re.compile(r'^\s*CONFIRM\s*$', _re.IGNORECASE)).first
+        if await confirm.count() == 0:
+            confirm = self.page.get_by_text("CONFIRM", exact=True).first
+
+        enabled = False
+        for _ in range(20):   # 最多等 10s
+            try:
+                dis_attr = await confirm.get_attribute("disabled")
+                cls = (await confirm.get_attribute("class")) or ""
+                if dis_attr is None and "disabled" not in cls.lower():
+                    enabled = True
+                    break
+            except Exception:
+                pass
+            await asyncio.sleep(0.5)
+        if not enabled:
+            await self.snap(f"ERR_confirm_still_disabled_{label_safe}")
+            raise RuntimeError("选座后 CONFIRM 按钮仍是禁用态（选座未生效），请查截图")
+
+        await confirm.click()
+        log.info("  ✔ 已点击 CONFIRM（按钮已启用）")
         await asyncio.sleep(1.5)
         await self.snap(f"15_confirmed_{label_safe}")
         await self._verify_booking_result(label_safe)
+
+    async def _pick_seat_in_seat_dialog(self) -> str:
+        """
+        在 "Seat" 单选列表中按优先级选座：
+          Tier0(S74,S86,S1,S17) → Tier1(S74-S86, S1-S17 其余)
+          → 都没有 → "Any available seat"（用户指定的兜底）
+        列表可滚动：边滚边收集，滚到底为止。
+        """
+        # 活跃弹窗 = Seat 列表（最后弹出的那个）
+        dialog = None
+        for sel in ['.v-dialog--active', '.v-overlay--active .v-dialog', '[role="dialog"]']:
+            loc = self.page.locator(sel)
+            n = await loc.count()
+            if n > 0:
+                dialog = loc.nth(n - 1)   # 取最后一个（最新弹出）
+                break
+        if dialog is None:
+            dialog = self.page.locator('.v-dialog').last
+
+        # 滚动收集所有选项
+        options: dict[str, object] = {}   # {normalize后座位号或"ANY": locator}
+        scroll_container = None
+        for sc_sel in ['.v-card__text', '.v-list', '[class*="list"]']:
+            sc = dialog.locator(sc_sel).first
+            if await sc.count() > 0:
+                scroll_container = sc
+                break
+
+        for _ in range(20):
+            for rel_sel in ['.v-radio', '[role="radio"]', 'label', '.v-list-item']:
+                els = dialog.locator(rel_sel)
+                cnt = await els.count()
+                if cnt == 0:
+                    continue
+                for i in range(cnt):
+                    el = els.nth(i)
+                    try:
+                        txt = (await el.inner_text()).strip()
+                    except Exception:
+                        continue
+                    if not txt:
+                        continue
+                    if "any available" in txt.lower():
+                        options.setdefault("ANY", el)
+                    else:
+                        sid = normalize_seat_id(txt)
+                        if sid and sid not in options:
+                            options[sid] = el
+                if cnt > 0:
+                    break
+            # 滚动一屏，滚到底就停
+            if scroll_container and await scroll_container.count() > 0:
+                at_bottom = await scroll_container.evaluate(
+                    "el => el.scrollTop + el.clientHeight >= el.scrollHeight - 5"
+                )
+                if at_bottom:
+                    break
+                await scroll_container.evaluate("el => el.scrollBy(0, 250)")
+                await asyncio.sleep(0.25)
+            else:
+                break
+
+        seat_ids = sorted(k for k in options if k != "ANY")
+        log.info(f"  📋 Seat 列表选项: {seat_ids}  ANY={'ANY' in options}")
+
+        # 按优先级点击：Tier0 → Tier1 → Any available seat
+        for tier_label, candidates in [
+            ("Tier0(最优先4座)",      [s for s in _TIER0 if s in options]),
+            ("Tier1(S74-S86,S1-S17)", [s for s in _TIER1 if s in options]),
+        ]:
+            log.info(f"  🔍 {tier_label} 候选: {candidates}")
+            for sid in candidates:
+                try:
+                    el = options[sid]
+                    await el.scroll_into_view_if_needed(timeout=5_000)
+                    await asyncio.sleep(0.3)
+                    await el.click()
+                    log.info(f"  ✅ 已点选 {sid}（{tier_label}）")
+                    await asyncio.sleep(0.6)
+                    return sid
+                except Exception as e:
+                    log.warning(f"  ⚠ 点击 {sid} 失败: {e}")
+                    continue
+
+        # 兜底：Any available seat（用户指定）
+        if "ANY" in options:
+            log.warning("  ⚠ 优先序列座位均不在列表，选 'Any available seat'")
+            el = options["ANY"]
+            await el.scroll_into_view_if_needed(timeout=5_000)
+            await el.click()
+            await asyncio.sleep(0.6)
+            return "Any available seat"
+
+        raise RuntimeError(f"Seat 列表无法选座，已见选项: {seat_ids}")
 
     async def _verify_booking_result(self, label_safe: str):
         """
@@ -931,139 +1073,6 @@ class NLBBooker:
                  f"(目标 {t.strftime('%d %b %Y')} {time_str})")
         return has_date and has_time
 
-    async def _pick_preferred_seat_in_dialog(self) -> str:
-        """
-        在 Preferred Seat 弹窗内，按优先级选择座位。
-
-        v9 修复：
-          1. 限定在 .v-dialog--active，不再被历史弹窗 DOM 残留污染。
-          2. 打印弹窗所有原始文字，方便日志诊断座位标签格式。
-          3. 放宽座位号识别：接受 "S74"/"74"/"SEAT74" 等多种格式，
-             用黑名单（图书馆名/时间/区域/Duration）过滤明显非座位条目。
-        """
-        await asyncio.sleep(0.5)
-
-        # ── 找当前活跃弹窗容器 ───────────────────────────────────────────
-        active_dialog = None
-        for active_sel in [
-            '.v-dialog--active',
-            '.v-overlay--active .v-dialog',
-            '.v-overlay--active [role="dialog"]',
-        ]:
-            loc = self.page.locator(active_sel)
-            if await loc.count() > 0:
-                active_dialog = loc.first
-                log.info(f"  Preferred Seat 弹窗容器: {active_sel!r}")
-                break
-        if active_dialog is None:
-            active_dialog = self.page.locator(
-                '.v-dialog:has-text("Preferred Seat"), [role="dialog"]:has-text("Preferred Seat")'
-            ).last
-            log.info("  Preferred Seat 弹窗容器（兜底）")
-
-        # ── 黑名单：明确不是座位的条目 ───────────────────────────────────
-        import re as _re
-        _BLACKLIST_PATTERNS = [
-            _re.compile(r'\d{1,2}:\d{2}\s*(AM|PM)', _re.IGNORECASE),  # 时间 "10:00AM"
-            _re.compile(r'\d+:\d{2}$'),            # Duration "1:30"
-            _re.compile(r'LIBRARY$'),              # 图书馆名
-            _re.compile(r'LEVEL\s*\d'),            # 区域含 Level
-            _re.compile(r'ZONE'),                  # 区域含 Zone
-            _re.compile(r'NO\s+PREFERRED', _re.IGNORECASE),
-        ]
-
-        def _is_likely_seat(raw: str) -> bool:
-            """粗判断：是否像座位号而非图书馆/时间/区域"""
-            u = raw.upper().replace(" ", "")
-            for pat in _BLACKLIST_PATTERNS:
-                if pat.search(u):
-                    return False
-            # 接受 "S74" / "74" / "SEAT74" / "S-74" 等
-            if _re.search(r'S[-]?\d+', u):
-                return True
-            if _re.fullmatch(r'\d+', u):
-                return True
-            # 其他短字符串也暂时保留，日志会打出来
-            if len(u) <= 8 and u:
-                return True
-            return False
-
-        # ── 收集弹窗内所有选项（含滚动扫描）────────────────────────────
-        available_in_dialog: dict[str, object] = {}
-        all_raw_texts: list[str] = []
-
-        scroll_container = None
-        for sc_sel in ['.v-list', '[class*="list"]', '.v-card__text']:
-            sc = active_dialog.locator(sc_sel).first
-            if await sc.count() > 0:
-                scroll_container = sc
-                break
-
-        for rel_sel in ['label', '[role="radio"]', '.v-radio', 'div.my-2']:
-            if available_in_dialog:
-                break
-            for scroll_idx in range(16):
-                els = active_dialog.locator(rel_sel)
-                cnt = await els.count()
-                for i in range(cnt):
-                    el = els.nth(i)
-                    try:
-                        txt = (await el.inner_text()).strip()
-                        if not txt:
-                            continue
-                        if txt not in all_raw_texts:
-                            all_raw_texts.append(txt)
-                        key = txt.upper().replace(" ", "")
-                        if key not in available_in_dialog and _is_likely_seat(txt):
-                            available_in_dialog[key] = el
-                    except Exception:
-                        continue
-
-                if scroll_idx >= 15:
-                    break
-                if scroll_container and await scroll_container.count() > 0:
-                    at_bottom = await scroll_container.evaluate(
-                        "el => el.scrollTop + el.clientHeight >= el.scrollHeight - 5"
-                    )
-                    if at_bottom:
-                        break
-                    await scroll_container.evaluate("el => el.scrollBy(0, 200)")
-                else:
-                    await active_dialog.evaluate("el => el.scrollBy(0, 200)")
-                await asyncio.sleep(0.2)
-
-            if available_in_dialog:
-                log.info(f"  📋 弹窗所有原始文字({rel_sel}): {all_raw_texts}")
-                log.info(f"  🪑 过滤后候选: {sorted(available_in_dialog.keys())}")
-                break
-
-        if not available_in_dialog:
-            log.warning(f"  ⚠ 弹窗所有原始文字: {all_raw_texts}")
-            log.warning("  ⚠ 未找到座位候选，保持 'No preferred seat'")
-            return "AUTO"
-
-        # ── 按优先级选座（v10：与座位图共用 normalize + tier 逻辑）──────
-        normalized = {normalize_seat_id(k): v for k, v in available_in_dialog.items()}
-        log.info(f"  🪑 标准化后: {sorted(normalized.keys())}")
-
-        for tier_label, candidates in iter_priority_tiers(list(normalized.keys())):
-            log.info(f"  🔍 弹窗尝试 {tier_label}，候选: {candidates}")
-            for seat_id in candidates:
-                el = normalized[seat_id]
-                try:
-                    await el.scroll_into_view_if_needed(timeout=5_000)
-                    await asyncio.sleep(0.3)
-                    await el.click()
-                    log.info(f"  ✅ Preferred Seat 弹窗已选: {seat_id}（{tier_label}）")
-                    await asyncio.sleep(0.5)
-                    return seat_id
-                except Exception as e:
-                    log.warning(f"  ⚠ 弹窗点击 {seat_id} 失败: {e}")
-                    continue
-
-        log.warning("  ⚠ 所有优先级座位均不可用，保持默认")
-        return "AUTO"
-
     async def _click_confirm_dialog(self, label_safe: str):
         """处理普通确认弹窗（OK / Confirm / Yes / CONFIRM）"""
         clicked = False
@@ -1083,109 +1092,6 @@ class NLBBooker:
             # v11：之前这里静默跳过，是假成功的隐患之一
             log.warning("  ⚠ 未找到任何确认按钮（OK/Confirm/Yes），可能根本没触发预约提交！")
             await self.snap(f"WARN_no_confirm_btn_{label_safe}")
-
-    # ── 按优先级选座 ──────────────────────────────────────────────────────
-    async def _pick_seat_by_priority(self, label_safe: str) -> str:
-        """
-        座位优先级（v10）：Tier0(最优先4座) → Tier1(S74-S86, S1-S17) → Tier2(其他)
-
-        v10 修复：
-          1. 【关键BUG】收集到的座位号现在统一 normalize_seat_id()，
-             之前 "74"/"Seat 74" 等格式永远匹配不上 "S74"，导致只能走兜底。
-          2. 属性读取改为单次 evaluate_all 批量获取，原来每个元素 5+ 次
-             round-trip，大座位图下耗时数分钟、易超时。
-          3. 点击后校验 class 是否变为 selected/active（warn-only），
-             点击未生效时自动重试一次。
-
-        返回实际选中的座位号；若无任何可用座位则返回 "AUTO"。
-        """
-        # ── 收集页面上所有可用（未禁用）座位元素 ────────────────────────
-        async def _get_available_seats() -> dict[str, object]:
-            """返回 {normalize后座位号: locator}。批量读属性，单次 round-trip。"""
-            available: dict[str, object] = {}
-            for sel in [
-                '[class*="seat"]:not([class*="disabled"]):not([class*="unavailable"])',
-                '[class*="seat"]:not([disabled])',
-                'button[class*="seat"]',
-                '[data-seat]',
-            ]:
-                els = self.page.locator(sel)
-                cnt = await els.count()
-                if cnt == 0:
-                    continue
-                log.info(f"  🔎 selector={sel!r} 匹配到 {cnt} 个元素")
-
-                # 一次性批量读取所有元素的关键属性（v10：替代逐元素 evaluate）
-                try:
-                    infos = await els.evaluate_all(
-                        """els => els.map(e => ({
-                            tag:  e.tagName,
-                            cls:  e.getAttribute('class') || '',
-                            ds:   e.getAttribute('data-seat') || '',
-                            aria: e.getAttribute('aria-label') || '',
-                            txt:  (e.innerText || '').trim(),
-                        }))"""
-                    )
-                except Exception as e:
-                    log.warning(f"  ⚠ 批量读取属性失败: {e}")
-                    continue
-
-                for i, info in enumerate(infos):
-                    raw = info["ds"] or info["aria"] or info["txt"]
-                    if not raw:
-                        continue
-                    seat_id = normalize_seat_id(raw)
-                    cls_low = info["cls"].lower()
-                    if any(k in cls_low for k in ("disabled", "unavailable", "booked", "occupied", "selected")):
-                        continue
-                    if seat_id not in available:
-                        available[seat_id] = els.nth(i)
-                        log.info(
-                            f"  📍 元素#{i}: <{info['tag']}> {seat_id} "
-                            f"(raw={raw!r} class={info['cls']!r})"
-                        )
-                if available:
-                    break
-            return available
-
-        available = await _get_available_seats()
-        log.info(f"  📋 可用座位数: {len(available)}  全部: {sorted(available.keys())}")
-
-        if not available:
-            log.warning("  ⚠ 未检测到可用座位，尝试直接进入预约详情页（系统自动分配）")
-            return "AUTO"
-
-        # ── 按优先级逐个尝试 ────────────────────────────────────────────
-        for tier_label, candidates in iter_priority_tiers(list(available.keys())):
-            log.info(f"  🔍 尝试 {tier_label}，候选: {candidates}")
-            for seat_id in candidates:
-                el = available[seat_id]
-                for attempt in (1, 2):   # 点击未生效时自动重试一次
-                    try:
-                        await el.scroll_into_view_if_needed(timeout=5_000)
-                        await asyncio.sleep(0.3)
-                        await el.click()
-                        await asyncio.sleep(0.5)
-                        # 校验点击是否生效（warn-only：class 出现 selected/active）
-                        try:
-                            cls_after = (await el.get_attribute("class")) or ""
-                            if any(k in cls_after.lower() for k in ("selected", "active", "chosen")):
-                                log.info(f"  ✔ 点击已生效（class={cls_after!r}）")
-                            elif attempt == 1:
-                                log.warning(f"  ⚠ class 未见选中标记（{cls_after!r}），重试点击...")
-                                continue
-                        except Exception:
-                            pass
-                        log.info(f"  ✅ 已选座位: {seat_id}（{tier_label}）")
-                        await asyncio.sleep(0.3)
-                        await self.snap(f"seat_selected_{seat_id}_{label_safe}")
-                        return seat_id
-                    except Exception as e:
-                        log.warning(f"  ⚠ 点击 {seat_id} 失败(attempt {attempt}): {e}")
-                        break   # 元素本身点不动，换下一个座位
-
-        raise RuntimeError("所有优先级座位均不可用，预约失败")
-
 
 # ═════════════════════════════════════════════════════════════════════════
 MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
