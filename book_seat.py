@@ -825,10 +825,24 @@ class NLBBooker:
           4. 回到 Selection 框，CONFIRM 由灰变蓝后点击
         """
         # 等 Selection 对话框出现
-        try:
-            await self.page.wait_for_selector('text="Select seat"', timeout=8_000)
-            log.info("  📋 检测到 Selection 对话框（Select seat 字段）")
-        except PlaywrightTimeout:
+        # v13 关键修复："Select seat" 是输入框的【占位符/label】，不是文本节点，
+        # text= 选择器永远匹配不到 —— 这就是上次日志"未见 Selection 对话框"
+        # 但截图明明有的原因！改用对话框标题 "Selection"（真实文本）检测。
+        dialog_seen = False
+        for det_sel in [
+            '.v-dialog--active:has-text("Selection")',
+            'text="Selection"',
+            '.v-dialog--active:has-text("CONFIRM")',
+        ]:
+            try:
+                await self.page.wait_for_selector(det_sel, timeout=4_000)
+                dialog_seen = True
+                log.info(f"  📋 检测到 Selection 对话框（{det_sel}）")
+                break
+            except PlaywrightTimeout:
+                continue
+
+        if not dialog_seen:
             log.warning("  ⚠ 未见 Selection 对话框，检查其他确认弹窗...")
             await self._click_confirm_dialog(label_safe)
             await self._verify_booking_result(label_safe)
@@ -837,29 +851,46 @@ class NLBBooker:
         await self.snap(f"14b_selection_dialog_{label_safe}")
 
         # 步骤1：点击 "Select seat" 字段，打开 Seat 单选列表
-        opened = False
-        for sel in [
-            'text="Select seat"',
-            '.v-dialog--active .v-select',
-            '.v-dialog--active .v-text-field',
+        # v13："Select seat" 是占位符 → text= 点不到，改用 input/placeholder/
+        # v-select 等结构选择器，每轮换一个选择器点击，点完检查列表是否弹出
+        click_sels = [
+            '.v-dialog--active [placeholder*="seat" i]',
             '.v-dialog--active input',
-        ]:
+            '.v-dialog--active .v-select',
+            '.v-dialog--active .v-input__slot',
+            '.v-dialog--active .v-text-field',
+            '.v-dialog--active label:has-text("Select seat")',
+        ]
+        seat_list_opened = False
+        for attempt in range(len(click_sels)):
+            sel = click_sels[attempt]
             try:
                 el = self.page.locator(sel).first
-                if await el.count() > 0:
-                    await el.click()
-                    # Seat 列表的标志：出现 "Any available seat"
+                if await el.count() == 0:
+                    log.info(f"  ↳ 选择器无命中，跳过: {sel}")
+                    continue
+                await el.click()
+                log.info(f"  ✔ 已点击 Select seat 字段（{sel}）")
+
+                # Seat 列表的标志：出现 "Any available seat"（radio 标签是真实文本）
+                try:
                     await self.page.wait_for_selector(
-                        'text="Any available seat"', timeout=5_000
+                        'text="Any available seat"', timeout=4_000
                     )
-                    opened = True
-                    log.info(f"  ✔ 已打开 Seat 单选列表（{sel}）")
+                    seat_list_opened = True
+                    log.info("  ✅ Seat 单选列表已打开")
                     break
-            except Exception:
+                except PlaywrightTimeout:
+                    log.warning(f"  ⚠ 点击后 Seat 列表未弹出，换下一个选择器...")
+                    await asyncio.sleep(0.5)
+                    continue
+            except Exception as e:
+                log.warning(f"  ⚠ 点击 {sel} 异常: {e}")
                 continue
-        if not opened:
+
+        if not seat_list_opened:
             await self.snap(f"ERR_seat_list_not_open_{label_safe}")
-            raise RuntimeError("点击 Select seat 后未弹出 Seat 列表，请查截图")
+            raise RuntimeError("点击 Select seat 多次后仍未弹出 Seat 列表，请查截图")
 
         await self.snap(f"14c_seat_list_{label_safe}")
 
@@ -1007,7 +1038,10 @@ class NLBBooker:
             return
         err_words = ["unsuccessful", "failed", "error occurred", "already booked",
                      "not available", "no longer available", "exceeded", "limit reached"]
-        ok_words  = ["success", "confirmed", "booking reference", "has been booked"]
+        # v13：去掉泛词 "success" —— 页面静态提示
+        # "...after a booking is made successfully" 会误中！改用确定性短语
+        ok_words  = ["booking reference", "has been booked", "booked successfully",
+                     "booking confirmed", "booking successful"]
 
         hit_err = [w for w in err_words if w in body_text]
         if hit_err:
@@ -1098,7 +1132,7 @@ MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
 
 
 async def main():
-    log.info(f"=== NLB v10 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
+    log.info(f"=== NLB v13 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
     log.info(f"座位优先级 Tier0: {_TIER0 or '(未配置)'}  Tier1: {_TIER1[0]}…{_TIER1[-1]} 共{len(_TIER1)}个")
 
     async with async_playwright() as pw:
