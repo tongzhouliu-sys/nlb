@@ -1036,8 +1036,10 @@ class NLBBooker:
             body_text = (await self.page.locator("body").inner_text()).lower()
         except Exception:
             return
-        err_words = ["unsuccessful", "failed", "error occurred", "already booked",
-                     "not available", "no longer available", "exceeded", "limit reached"]
+        err_words = ["booking unsuccessful", "unsuccessful booking", "booking was unsuccessful",
+                     "booking failed", "failed to book", "submission failed",
+                     "error occurred", "already booked", "not available", "no longer available",
+                     "exceeded", "limit reached"]
         # v13：去掉泛词 "success" —— 页面静态提示
         # "...after a booking is made successfully" 会误中！改用确定性短语
         ok_words  = ["booking reference", "has been booked", "booked successfully",
