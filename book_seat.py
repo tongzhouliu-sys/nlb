@@ -1061,11 +1061,9 @@ class NLBBooker:
 
     async def _verify_booking_result(self, label_safe: str):
         """
-        v10：CONFIRM 后检查页面结果。
-          - 命中错误关键词（fail/error/already booked/not available/limit）→ 抛错，
-            触发 main() 的单时段重试。
-          - 命中成功关键词 → 记录日志。
-          - 都没命中 → warn-only 放行（最终以 verify_booking_exists 为准）。
+        v14：CONFIRM 后检查页面结果。
+          - 命中错误关键词时改发 warning 提示，不阻断流程，
+            最终由 verify_booking_exists 登录 My Bookings 列表做真实性核查（彻底解决页面静态/隐藏文本导致的误报）。
         """
         await asyncio.sleep(1.0)
         try:
@@ -1076,18 +1074,17 @@ class NLBBooker:
                      "booking failed", "failed to book", "submission failed",
                      "error occurred", "already booked", "not available", "no longer available",
                      "exceeded", "limit reached"]
-        # v13：去掉泛词 "success" —— 页面静态提示
-        # "...after a booking is made successfully" 会误中！改用确定性短语
         ok_words  = ["booking reference", "has been booked", "booked successfully",
                      "booking confirmed", "booking successful"]
 
         hit_err = [w for w in err_words if w in body_text]
-        if hit_err:
-            await self.snap(f"ERR_result_{label_safe}")
-            raise RuntimeError(f"预约结果页含错误提示: {hit_err}")
         hit_ok = [w for w in ok_words if w in body_text]
+
         if hit_ok:
-            log.info(f"  ✅ 预约结果验证通过（命中: {hit_ok}）")
+            log.info(f"  ✅ 预约结果页面验证通过（命中: {hit_ok}）")
+        elif hit_err:
+            log.warning(f"  ⚠ 结果页检测到提示词 {hit_err}（可能是页面静态文案/历史残留），将交由 Bookings 列表做终极核查...")
+            await self.snap(f"WARN_result_{label_safe}")
         else:
             log.warning("  ⚠ 结果页未见明确成功/失败文案（最终以 Bookings 列表核实为准）")
 
