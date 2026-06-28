@@ -29,6 +29,7 @@ cd nlb-seat-booking
 |-------------|-----|
 | `NLB_USERNAME` | 你的 myLibrary ID / NRIC / Email |
 | `NLB_PASSWORD` | 你的 NLB 密码 |
+| `FEISHU_WEBHOOK_URL` | （可选）飞书自定义机器人的 Webhook 地址 |
 
 > ⚠️ **永远不要把账号密码写进代码或 commit 里！**
 

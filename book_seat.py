@@ -32,6 +32,42 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 # ── 配置区 ────────────────────────────────────────────────────────────────
 NLB_USERNAME = os.environ["NLB_USERNAME"]
 NLB_PASSWORD = os.environ["NLB_PASSWORD"]
+FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+
+
+def send_feishu_notification(title: str, content_markdown: str, is_success: bool = True):
+    webhook_url = FEISHU_WEBHOOK_URL.strip()
+    if not webhook_url:
+        log.info("ℹ 未配置 FEISHU_WEBHOOK_URL，跳过飞书推送。")
+        return
+    import json
+    import urllib.request
+    card_template = "green" if is_success else "red"
+    payload = {
+        "msg_type": "interactive",
+        "card": {
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "template": card_template
+            },
+            "elements": [
+                {
+                    "tag": "div",
+                    "text": {"tag": "lark_md", "content": content_markdown}
+                }
+            ]
+        }
+    }
+    try:
+        req = urllib.request.Request(
+            webhook_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            log.info("📱 飞书推送成功")
+    except Exception as e:
+        log.error(f"❌ 飞书推送失败: {e}")
 
 TARGET_LIBRARY = "Punggol Library"
 TARGET_AREA    = "Study Zone, Level 3"
@@ -1193,6 +1229,24 @@ async def main():
             for label, status in results:
                 log.info(f"  {label}  →  {status}")
             log.info("=" * 60)
+
+            # 飞书消息推送（如果有成功预约）
+            success_count = sum(1 for _, status in results if "✅" in status)
+            if success_count > 0:
+                target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
+                msg_lines = [
+                    f"**📅 预约日期**：{target_date}",
+                    f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})",
+                    "**📋 预约详情**："
+                ]
+                for label, status in results:
+                    msg_lines.append(f"- **{label}**：{status}")
+                
+                send_feishu_notification(
+                    title="🪑 NLB 图书馆座位预约成功！",
+                    content_markdown="\n".join(msg_lines),
+                    is_success=True
+                )
 
             # 任一时段最终失败 → 非零退出码，让 GitHub Actions 标红便于发现
             if any(status.startswith("❌") for _, status in results):

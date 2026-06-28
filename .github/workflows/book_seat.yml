@@ -49,6 +49,7 @@ jobs:
         env:
           NLB_USERNAME: ${{ secrets.NLB_USERNAME }}
           NLB_PASSWORD: ${{ secrets.NLB_PASSWORD }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           BOOKING_DATE_OFFSET: ${{ github.event.inputs.date_offset || '1' }}
         run: python book_seat.py
 
