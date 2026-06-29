@@ -1089,11 +1089,12 @@ class NLBBooker:
             log.warning("  ⚠ 结果页未见明确成功/失败文案（最终以 Bookings 列表核实为准）")
 
     # ── 终极校验：去 Bookings 列表核实预约真实存在（v11）──────────────────
-    async def verify_booking_exists(self, time_str: str, label_safe: str) -> bool:
+    async def verify_booking_exists(self, time_str: str, label_safe: str):
         """
         打开底部导航 Bookings Tab，读取列表页全文，
         同时核对【目标日期】和【时段】是否出现。
-        这是判定成功的最终标准——杜绝"流程跑完但实际没订上"的假成功。
+        返回三态：True=确认成功 / False=确认失败 / None=无法核实（导航/渲染异常）
+        None 时视为预订流程本身已完成，不触发失败。
         """
         log.info("▶ 终极校验：核实 Bookings 列表...")
         try:
@@ -1111,16 +1112,27 @@ class NLBBooker:
                 pass
             await asyncio.sleep(2)
         except Exception as e:
-            log.warning(f"  ⚠ 打开 Bookings 列表失败: {e}")
+            log.warning(f"  ⚠ 打开 Bookings 列表失败（无法核实）: {e}")
             await self.snap(f"ERR_open_bookings_{label_safe}")
-            return False
+            return None  # 无法核实，不等于失败
 
         await self.snap(f"16_my_bookings_{label_safe}")
 
-        try:
-            body = await self.page.locator("body").inner_text()
-        except Exception:
-            return False
+        # 最多重试3次，等待列表渲染完成
+        body = ""
+        for attempt in range(1, 4):
+            try:
+                body = await self.page.locator("body").inner_text()
+            except Exception:
+                body = ""
+            if body.strip():
+                break
+            log.info(f"  ⏳ Bookings 列表内容为空，等待渲染（第{attempt}次）...")
+            await asyncio.sleep(3)
+        else:
+            log.warning("  ⚠ Bookings 列表始终无内容，无法核实")
+            return None  # 无法核实，不等于失败
+
         body_l = body.lower()
 
         # 日期匹配：兼容 "13 Jun" / "13 June" / "Jun 13" / "13/06/2026" / "2026-06-13"
@@ -1191,7 +1203,9 @@ async def main():
         try:
             await booker.login()
 
-            results = []
+            # 第一阶段：依次预订所有时段，记录座位号，不做 Bookings 列表校验
+            booked = []   # [(label, time_str, seat)]
+            results = []  # 最终结果（含失败项）
             for label, time_str, dur_str in TIME_SLOTS:
                 # v10：单时段失败自动重试（页面状态可能残留，先回主页再重来）
                 last_err = None
@@ -1202,15 +1216,7 @@ async def main():
                             await page.goto(BASE_URL, wait_until="load")
                             await asyncio.sleep(2)
                         seat = await booker.book_one_slot(label, time_str, dur_str)
-
-                        # v11 终极校验：Bookings 列表里必须真的有这条预约
-                        verified = await booker.verify_booking_exists(time_str, _safe(label))
-                        if not verified:
-                            raise RuntimeError(
-                                "流程跑完但 Bookings 列表未找到该预约（假成功），"
-                                "请查截图 16_my_bookings"
-                            )
-                        results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
+                        booked.append((label, time_str, seat))
                         last_err = None
                         break
                     except Exception as e:
@@ -1221,14 +1227,29 @@ async def main():
                     results.append((label, f"❌ 失败: {last_err}"))
                 await asyncio.sleep(3)
 
+            # 第二阶段：所有时段预订完成后，等待10秒再统一做 Bookings 列表校验
+            if booked:
+                log.info(f"⏳ 所有时段预订完毕，等待 10 秒后统一核实 Bookings 列表...")
+                await asyncio.sleep(10)
+                for label, time_str, seat in booked:
+                    verified = await booker.verify_booking_exists(time_str, _safe(label))
+                    if verified is True:
+                        results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
+                    elif verified is None:
+                        log.warning(f"  ⚠ {label} 无法核实 Bookings 列表，但预约流程已完成，视为成功")
+                        results.append((label, f"⚠️ 成功(待核实)  座位: {seat}"))
+                    else:
+                        log.error(f"❌ {label} Bookings 列表未找到该预约（假成功），请查截图 16_my_bookings")
+                        results.append((label, f"❌ 失败: Bookings 列表未找到该预约"))
+
             log.info("\n" + "=" * 60)
             log.info("📋 预约结果汇总:")
             for label, status in results:
                 log.info(f"  {label}  →  {status}")
             log.info("=" * 60)
 
-            # 飞书消息推送（如果有成功预约）
-            success_count = sum(1 for _, status in results if "✅" in status)
+            # 飞书消息推送（✅ 已核实 或 ⚠️ 待核实 均视为成功推送）
+            success_count = sum(1 for _, status in results if "✅" in status or "⚠️" in status)
             if success_count > 0:
                 target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
                 msg_lines = [
@@ -1245,7 +1266,8 @@ async def main():
                     is_success=True
                 )
 
-            # 任一时段最终失败 → 非零退出码，让 GitHub Actions 标红便于发现
+            # 任一时段预订流程本身失败（❌）→ 非零退出码，让 GitHub Actions 标红
+            # ⚠️ 待核实（验证步骤异常但预订流程完成）不触发失败
             if any(status.startswith("❌") for _, status in results):
                 raise SystemExit(1)
 

@@ -2,8 +2,9 @@ name: NLB Seat Auto-Booking
 
 on:
   # 每天 12:00 SGT (= 04:00 UTC) 自动触发
+  # 提前10分钟到 03:50 UTC，抵消 GitHub 排队延迟 + 随机等待（30-240s）
   schedule:
-    - cron: "0 4 * * *"
+    - cron: "50 3 * * *"
 
   # 也可在 Actions 页面手动触发（方便测试）
   workflow_dispatch:
