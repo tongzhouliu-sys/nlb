@@ -1131,6 +1131,25 @@ class NLBBooker:
             await self.snap(f"ERR_open_bookings_{label_safe}")
             return None  # 无法核实，不等于失败
 
+        # ── 切到 "Upcoming" 标签页核实（v13 修复）────────────────────────────
+        # 预约的是未来日期（offset≥1），记录显示在 "Upcoming" 标签下；
+        # My Bookings 默认停留的 "Today" 只列出当天预约 → 在 Today 页核对会
+        # 查不到本次预约 → 误判为「假成功/失败」。故核实前必须先点 Upcoming。
+        try:
+            upcoming_tab = self.page.locator(
+                '[role="tab"]:has-text("Upcoming"), '
+                '.v-tab:has-text("Upcoming"), '
+                '.v-btn__content:has-text("Upcoming"), '
+                'button:has-text("Upcoming"), '
+                'span:has-text("Upcoming")'
+            ).first
+            await upcoming_tab.wait_for(state="visible", timeout=8_000)
+            await upcoming_tab.click()
+            log.info("  ✔ 已切换到 Upcoming 标签页核实")
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.warning(f"  ⚠ 未能切换到 Upcoming 标签页（改用当前页面核实）: {e}")
+
         await self.snap(f"16_my_bookings_{label_safe}")
 
         # 最多重试3次，等待列表渲染完成
