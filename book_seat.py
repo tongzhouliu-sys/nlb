@@ -551,6 +551,19 @@ class NLBBooker:
 
         await asyncio.sleep(0.5)
         await self.snap("08_date")
+
+        # 读取页面 Date 字段，确认实际选中的日期与目标一致
+        try:
+            date_field = self.page.locator('.inputPopupSelectDiv').filter(has_text="Date").first
+            actual_text = (await date_field.inner_text()).strip()
+            log.info(f"  📅 Date 字段实际内容: {actual_text!r}  目标: {target.strftime('%-d %b %Y')}")
+            day_str = str(target.day)
+            month_str = target.strftime("%b")
+            if day_str not in actual_text or month_str.lower() not in actual_text.lower():
+                log.warning(f"  ⚠ Date 字段与目标不一致！期望 {target.strftime('%-d %b %Y')!r}，实际 {actual_text!r}")
+        except Exception as e:
+            log.warning(f"  ⚠ 无法读取 Date 字段确认: {e}")
+
         log.info(f"  ✅ Date 已选: {target.strftime('%-d %b %Y')}")
         return target
 
@@ -738,7 +751,8 @@ class NLBBooker:
         await self.navigate_to_new_booking()
         await self.select_library()
         await self.select_area()
-        self._last_target_date = await self.select_date()   # v11：记录目标日期供终极校验用
+        target_date = await self.select_date()
+        self._last_target_date = target_date   # 保留供 _verify_booking_details 使用
         await self.select_time(time_str)
         await self.select_duration(dur_candidates)
 
@@ -749,7 +763,7 @@ class NLBBooker:
 
         await self._click_area_and_book(label, time_str)
         log.info(f"🎉 {label} 预约完成！")
-        return TARGET_AREA
+        return TARGET_AREA, target_date
     # ── 点击区域结果卡片并完成预约 ──────────────────────────────────────
     async def _click_area_and_book(self, label: str, time_str: str):
         """
@@ -1089,12 +1103,13 @@ class NLBBooker:
             log.warning("  ⚠ 结果页未见明确成功/失败文案（最终以 Bookings 列表核实为准）")
 
     # ── 终极校验：去 Bookings 列表核实预约真实存在（v11）──────────────────
-    async def verify_booking_exists(self, time_str: str, label_safe: str):
+    async def verify_booking_exists(self, time_str: str, label_safe: str, target_date: datetime = None):
         """
         打开底部导航 Bookings Tab，读取列表页全文，
         同时核对【目标日期】和【时段】是否出现。
         返回三态：True=确认成功 / False=确认失败 / None=无法核实（导航/渲染异常）
         None 时视为预订流程本身已完成，不触发失败。
+        target_date: 本次预约的目标日期，不传则回退到 self._last_target_date
         """
         log.info("▶ 终极校验：核实 Bookings 列表...")
         try:
@@ -1136,7 +1151,7 @@ class NLBBooker:
         body_l = body.lower()
 
         # 日期匹配：兼容 "13 Jun" / "13 June" / "Jun 13" / "13/06/2026" / "2026-06-13"
-        t = self._last_target_date
+        t = target_date if target_date is not None else self._last_target_date
         date_variants = [
             f"{t.day} {t.strftime('%b')}",  f"{t.day:02d} {t.strftime('%b')}",
             f"{t.day} {t.strftime('%B')}",  f"{t.strftime('%b')} {t.day}",
@@ -1215,8 +1230,8 @@ async def main():
                             log.warning(f"🔁 {label} 第 {attempt} 次尝试（共{MAX_RETRIES_PER_SLOT}次）...")
                             await page.goto(BASE_URL, wait_until="load")
                             await asyncio.sleep(2)
-                        seat = await booker.book_one_slot(label, time_str, dur_str)
-                        booked.append((label, time_str, seat))
+                        seat, target_date = await booker.book_one_slot(label, time_str, dur_str)
+                        booked.append((label, time_str, seat, target_date))
                         last_err = None
                         break
                     except Exception as e:
@@ -1231,8 +1246,8 @@ async def main():
             if booked:
                 log.info(f"⏳ 所有时段预订完毕，等待 10 秒后统一核实 Bookings 列表...")
                 await asyncio.sleep(10)
-                for label, time_str, seat in booked:
-                    verified = await booker.verify_booking_exists(time_str, _safe(label))
+                for label, time_str, seat, target_date in booked:
+                    verified = await booker.verify_booking_exists(time_str, _safe(label), target_date)
                     if verified is True:
                         results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
                     elif verified is None:
