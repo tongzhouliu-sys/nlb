@@ -761,9 +761,9 @@ class NLBBooker:
 
         await self.check_available_slots()
 
-        await self._click_area_and_book(label, time_str)
-        log.info(f"🎉 {label} 预约完成！")
-        return TARGET_AREA, target_date
+        chosen_seat = await self._click_area_and_book(label, time_str)
+        log.info(f"🎉 {label} 预约完成！座位: {chosen_seat}")
+        return (chosen_seat or "未知（未捕获到座位号，请查截图）"), target_date
     # ── 点击区域结果卡片并完成预约 ──────────────────────────────────────
     async def _click_area_and_book(self, label: str, time_str: str):
         """
@@ -825,7 +825,8 @@ class NLBBooker:
         await self.snap(f"14_after_book_{s}")
 
         # ── 处理 "Selection" 选座对话框 ──────────────────────────────────
-        await self._handle_selection_dialog(s)
+        chosen_seat = await self._handle_selection_dialog(s)
+        return chosen_seat
 
     # ── 点 BOOK 前核对 Booking Details（v12）────────────────────────────
     async def _verify_booking_details(self, label: str, time_str: str):
@@ -896,7 +897,7 @@ class NLBBooker:
             log.warning("  ⚠ 未见 Selection 对话框，检查其他确认弹窗...")
             await self._click_confirm_dialog(label_safe)
             await self._verify_booking_result(label_safe)
-            return
+            return None
 
         await self.snap(f"14b_selection_dialog_{label_safe}")
 
@@ -978,6 +979,7 @@ class NLBBooker:
         await asyncio.sleep(1.5)
         await self.snap(f"15_confirmed_{label_safe}")
         await self._verify_booking_result(label_safe)
+        return chosen
 
     async def _pick_seat_in_seat_dialog(self) -> str:
         """
@@ -1293,6 +1295,11 @@ async def main():
                 ]
                 for label, status in results:
                     msg_lines.append(f"- **{label}**：{status}")
+                seats_summary = ", ".join(
+                    seat for _, _, seat, _ in booked if seat
+                )
+                if seats_summary:
+                    msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
                 
                 send_feishu_notification(
                     title="🪑 NLB 图书馆座位预约成功！",
