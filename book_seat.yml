@@ -1,9 +1,9 @@
 name: NLB Seat Auto-Booking
 
 on:
-  # 每天 12:00 SGT (= 04:00 UTC) 自动触发
+  # 每天 UTC 04:10 自动触发（= 12:10 SGT）
   schedule:
-    - cron: "0 4 * * *"
+    - cron: "10 4 * * *"
 
   # 也可在 Actions 页面手动触发（方便测试）
   workflow_dispatch:
@@ -37,13 +37,28 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      # ── 4. 执行预约脚本 ───────────────────────────────────────────
+      # ── 3.5 安装完环境后随机等待（30–240 秒） ────────────────────
+      - name: ⏳ Random delay after setup (30–240s)
+        run: |
+          DELAY=$(( RANDOM % 211 + 30 ))
+          echo "Sleeping for ${DELAY} seconds before booking..."
+          sleep "$DELAY"
+
+      # ── 4. 执行预约脚本（第一个座位） ────────────────────────────
       - name: 🪑 Run booking script
         env:
           NLB_USERNAME: ${{ secrets.NLB_USERNAME }}
           NLB_PASSWORD: ${{ secrets.NLB_PASSWORD }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
           BOOKING_DATE_OFFSET: ${{ github.event.inputs.date_offset || '1' }}
         run: python book_seat.py
+
+      # ── 4.5 预约完第一个后随机等待（5–120 秒） ───────────────────
+      - name: ⏳ Random delay after first booking (5–120s)
+        run: |
+          DELAY=$(( RANDOM % 116 + 5 ))
+          echo "Sleeping for ${DELAY} seconds after first booking..."
+          sleep "$DELAY"
 
       # ── 5. 上传截图（失败时也上传，便于排查） ─────────────────────
       - name: 📸 Upload screenshots (debug)

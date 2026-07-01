@@ -10,7 +10,7 @@ v12 核心修正（基于真实手机截图，纠正了对 NLB UI 的两个错�
   2. 【12:00pm 误订修复】_pick_dialog_radio 的 :has-text() 是子串匹配，
      "12:00 pm" 包含 "2:00 pm" → 下午时段被订成中午！改为 ^...$ 精确匹配
   3. 【BOOK 前核对】Booking Details 页核对日期+起始时段，不符即抛错重试
-     （结束时间不符仅警告——Duration 没选上 1.5h 时能从日志看出来）
+     （结束时间不符仅警告——Duration 没选上 2h 时能从日志看出来）
   4. 选座兜底：优先序列都不在列表 → 选 "Any available seat"（用户指定）
   5. CONFIRM 必须确认已脱离禁用态才点击，仍禁用则抛错（选座未生效）
   6. 移除基于错误 UI 认知的死代码（座位图扫描、Preferred Seat 弹窗处理）
@@ -104,8 +104,8 @@ BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
 # Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
 TIME_SLOTS = [
-    ("10:00–11:30", "10:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1:30", "1 hour 30 mins", "90 mins", "1.5 hours", "1 hr 30 min"]),
-    ("14:00–15:30", "2:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1:30", "1 hour 30 mins", "90 mins", "1.5 hours", "1 hr 30 min"]),
+    ("10:00–12:00", "10:00 am", ["2:00", "2 hours", "120 mins", "2 hrs", "2 hr", "2 hr 0 min"]),
+    ("14:00–16:00", "2:00 pm",  ["2:00", "2 hours", "120 mins", "2 hrs", "2 hr", "2 hr 0 min"]),
 ]
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
@@ -860,7 +860,7 @@ class NLBBooker:
             h, m = end_hm.split(":")
             variants = {end_hm, f"{int(h) % 12 or 12}:{m}"}
             if not any(v in body for v in variants):
-                log.warning(f"  ⚠ Booking Details 结束时间未见 {variants}（Duration 可能没选上 1.5h，请查截图 13）")
+                log.warning(f"  ⚠ Booking Details 结束时间未见 {variants}（Duration 可能没选上 2h，请查截图 13）")
 
         log.info(f"  ✅ Booking Details 核对通过: {t.strftime('%d %b')} {time_str}")
 
