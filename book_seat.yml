@@ -1,11 +1,13 @@
 name: NLB Seat Auto-Booking
 
 on:
-  # 每天 UTC 04:10 自动触发（= 12:10 SGT）
+  # 提前到 UTC 03:35（= 11:35 SGT）触发。
+  # 原因：GitHub Actions 定时任务常有 3–15 分钟排队延迟，且装环境需 2–4 分钟。
+  # 真正的预约动作由下方 "Wait until 12:00:00 SGT" 步骤精确卡点开始。
   schedule:
-    - cron: "10 4 * * *"
+    - cron: "35 3 * * *"
 
-  # 也可在 Actions 页面手动触发（方便测试）
+  # Actions 页面手动触发（测试用，不等待卡点，立即执行）
   workflow_dispatch:
     inputs:
       date_offset:
@@ -16,7 +18,14 @@ on:
 jobs:
   book-seat:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # 等待卡点最长约 25 分钟 + 预约流程约 10 分钟，需放宽超时
+    timeout-minutes: 45
+    env:
+      # 统一 Runner 日志时区为 SGT，避免日志前缀（原为 UTC）与程序内
+      # datetime.now(SGT) 打印的时间相差 8 小时造成误解。
+      # 注：下方 "Wait until 12:00:00 SGT" 步骤中的 `date -u ...` 显式带 -u，
+      # 按 UTC 解析/输出，不受此 TZ 影响，等待卡点计算逻辑不变。
+      TZ: Asia/Singapore
 
     steps:
       # ── 1. 拉取代码 ───────────────────────────────────────────────
@@ -37,14 +46,22 @@ jobs:
           playwright install chromium
           playwright install-deps chromium
 
-      # ── 3.5 安装完环境后随机等待（30–240 秒） ────────────────────
-      - name: ⏳ Random delay after setup (30–240s)
+      # ── 4. 定时触发时：精确等到 12:00:00 SGT（= 04:00:00 UTC）────
+      #     新加坡无夏令时，固定 UTC+8，直接按 UTC 计算即可
+      - name: ⏳ Wait until 12:00:00 SGT
+        if: github.event_name == 'schedule'
         run: |
-          DELAY=$(( RANDOM % 211 + 30 ))
-          echo "Sleeping for ${DELAY} seconds before booking..."
-          sleep "$DELAY"
+          TARGET=$(date -u -d "today 04:00:00" +%s)
+          NOW=$(date -u +%s)
+          if [ "$NOW" -lt "$TARGET" ]; then
+            WAIT=$(( TARGET - NOW ))
+            echo "Sleeping ${WAIT}s until 12:00:00 SGT..."
+            sleep "$WAIT"
+          else
+            echo "Trigger was late, already past 12:00 SGT, starting immediately."
+          fi
 
-      # ── 4. 执行预约脚本（第一个座位） ────────────────────────────
+      # ── 5. 执行预约脚本（一次运行内完成两个时段）──────────────────
       - name: 🪑 Run booking script
         env:
           NLB_USERNAME: ${{ secrets.NLB_USERNAME }}
@@ -53,14 +70,7 @@ jobs:
           BOOKING_DATE_OFFSET: ${{ github.event.inputs.date_offset || '1' }}
         run: python book_seat.py
 
-      # ── 4.5 预约完第一个后随机等待（5–120 秒） ───────────────────
-      - name: ⏳ Random delay after first booking (5–120s)
-        run: |
-          DELAY=$(( RANDOM % 116 + 5 ))
-          echo "Sleeping for ${DELAY} seconds after first booking..."
-          sleep "$DELAY"
-
-      # ── 5. 上传截图（失败时也上传，便于排查） ─────────────────────
+      # ── 6. 上传截图（失败时也上传，便于排查）──────────────────────
       - name: 📸 Upload screenshots (debug)
         if: always()
         uses: actions/upload-artifact@v4
