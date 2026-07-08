@@ -1,6 +1,17 @@
 """
-NLB Seat Booking Automation Script  (v12 — 依据实机截图重写选座流程)
+NLB Seat Booking Automation Script  (v15 — 修复核实阶段"假失败")
 =========================================================================
+v15 核心修正（基于真实手机截图）：
+  【假失败根因】My Bookings 顶部的红色提醒横幅
+    "You must check-in before 14 minutes…automatically be cancelled"
+    会盖住 Today/Upcoming/Cancelled 标签栏 → 脚本点不到 Upcoming → 落到默认的
+    Today(当天) 列表 → 目标(未来)日期查不到 → 明明预订成功却误报失败。
+  【修复】① 新增 _dismiss_banner()：只按该横幅独有文案定位并关掉，绝不误关选座
+    等业务对话框。② 新增 _goto() 统一跳转：任何页面切换后先关横幅再继续（顺带
+    预防主页底部 New/Account/Booking 标签被横幅挡住）。③ verify 里进 My Bookings
+    后先关横幅→点 Upcoming→用 _is_upcoming_active() 确认已激活（带重试）；无法
+    确认切到 Upcoming 时返回 None(无法核实→视为成功)，不再判失败。
+
 v12 核心修正（基于真实手机截图，纠正了对 NLB UI 的两个错误认知）：
   1. 【真实流程】区域卡片 → 直接进 Booking Details（没有座位图页！）
      → 点 BOOK → "Selection" 对话框 → 必须先点 "Select seat" 输入框
@@ -149,8 +160,7 @@ class NLBBooker:
           5. 等待跳回 nlb.gov.sg，确认已登录
         """
         log.info("▶ 打开主页...")
-        await self.page.goto(BASE_URL, wait_until="load")
-        await asyncio.sleep(2)
+        await self._goto()
         await self.snap("01_home")
 
         # 步骤 1：点击底部导航 "Account" Tab
@@ -252,8 +262,7 @@ class NLBBooker:
     # ── 打开 New Booking 页 ───────────────────────────────────────────────
     async def navigate_to_new_booking(self):
         log.info("▶ 打开新建预约页...")
-        await self.page.goto(BASE_URL, wait_until="load")
-        await asyncio.sleep(2)
+        await self._goto()
         # 点底部导航 "New" Tab
         try:
             await self.page.locator('.v-btn__content:has-text("New")').first.click()
@@ -1104,6 +1113,73 @@ class NLBBooker:
         else:
             log.warning("  ⚠ 结果页未见明确成功/失败文案（最终以 Bookings 列表核实为准）")
 
+    # ── v15：关闭红色提醒横幅（核实阶段假失败根因）─────────────────────────
+    async def _dismiss_banner(self) -> bool:
+        """任何页面切换后调用：若顶部出现红色提醒横幅
+        （"…check-in before 14 minutes…automatically be cancelled"），先找到它的
+        关闭按钮（X）关掉，再继续。
+        ⚠ 只按该横幅独有文案定位（Booking 卡片写的是 "check-in no later than"，
+          不会命中），绝不误关选座 / Selection 等业务对话框。找不到即跳过。"""
+        banner_kw = ["automatically be cancelled", "check-in before"]
+        dismissed = False
+        for _ in range(3):  # 可能堆叠多条，连关几次
+            banner = None
+            for kw in banner_kw:
+                cand = self.page.locator(
+                    f'.v-alert:has-text("{kw}"), '
+                    f'.v-banner:has-text("{kw}"), '
+                    f'[role="alert"]:has-text("{kw}")'
+                ).first
+                try:
+                    if await cand.count() and await cand.is_visible():
+                        banner = cand
+                        break
+                except Exception:
+                    continue
+            if banner is None:
+                break
+            # 只在该横幅内部找关闭控件（X 通常是最后一个图标/按钮）
+            clicked = False
+            for sub in ['.v-alert__close', 'button[aria-label*="close" i]',
+                        'button', '.v-icon']:
+                try:
+                    x = banner.locator(sub).last
+                    if await x.count() == 0 or not await x.is_visible():
+                        continue
+                    await x.click(timeout=2_000)
+                    log.info(f"  ✔ 已关闭红色提醒横幅（{sub}）")
+                    dismissed = True
+                    clicked = True
+                    await asyncio.sleep(0.6)
+                    break
+                except Exception:
+                    continue
+            if not clicked:
+                break
+        return dismissed
+
+    async def _goto(self, url: str = BASE_URL, wait_until: str = "load"):
+        """统一页面跳转：跳转后固定先关掉红色提醒横幅，再交回调用方继续。
+        规则：任何页面切换都先看有没有红色弹窗，有就先关掉再做别的。"""
+        await self.page.goto(url, wait_until=wait_until)
+        await asyncio.sleep(2)
+        await self._dismiss_banner()
+
+    async def _is_upcoming_active(self) -> bool:
+        """确认 My Bookings 当前确实停在 Upcoming 标签（Vuetify active/selected）。"""
+        for sel in [
+            '.v-tab--active:has-text("Upcoming")',
+            '.v-tab--selected:has-text("Upcoming")',
+            '[role="tab"][aria-selected="true"]:has-text("Upcoming")',
+        ]:
+            try:
+                el = self.page.locator(sel).first
+                if await el.count() and await el.is_visible():
+                    return True
+            except Exception:
+                continue
+        return False
+
     # ── 终极校验：去 Bookings 列表核实预约真实存在（v11）──────────────────
     async def verify_booking_exists(self, time_str: str, label_safe: str, target_date: datetime = None):
         """
@@ -1115,8 +1191,7 @@ class NLBBooker:
         """
         log.info("▶ 终极校验：核实 Bookings 列表...")
         try:
-            await self.page.goto(BASE_URL, wait_until="load")
-            await asyncio.sleep(2)
+            await self._goto()   # 跳主页并先关掉红色横幅
             tab = self.page.locator(
                 '.v-btn__content:has-text("Booking"), '
                 'span:has-text("Booking"), button:has-text("Booking")'
@@ -1133,24 +1208,38 @@ class NLBBooker:
             await self.snap(f"ERR_open_bookings_{label_safe}")
             return None  # 无法核实，不等于失败
 
-        # ── 切到 "Upcoming" 标签页核实（v13 修复）────────────────────────────
-        # 预约的是未来日期（offset≥1），记录显示在 "Upcoming" 标签下；
-        # My Bookings 默认停留的 "Today" 只列出当天预约 → 在 Today 页核对会
-        # 查不到本次预约 → 误判为「假成功/失败」。故核实前必须先点 Upcoming。
-        try:
-            upcoming_tab = self.page.locator(
-                '[role="tab"]:has-text("Upcoming"), '
-                '.v-tab:has-text("Upcoming"), '
-                '.v-btn__content:has-text("Upcoming"), '
-                'button:has-text("Upcoming"), '
-                'span:has-text("Upcoming")'
-            ).first
-            await upcoming_tab.wait_for(state="visible", timeout=8_000)
-            await upcoming_tab.click()
-            log.info("  ✔ 已切换到 Upcoming 标签页核实")
-            await asyncio.sleep(2)
-        except Exception as e:
-            log.warning(f"  ⚠ 未能切换到 Upcoming 标签页（改用当前页面核实）: {e}")
+        # ── v15 根因修复：进 My Bookings 后先关红色提醒横幅，再切 Upcoming ────
+        # "You must check-in before 14 minutes…automatically be cancelled" 这条
+        # 红色横幅会盖住 My Bookings 顶部的 Today/Upcoming/Cancelled 标签栏；不关掉
+        # 就点不到 Upcoming → 落到默认的 Today(当天) 列表 → 目标(未来)日期查不到
+        # → 明明预订成功却误报失败。（点 Booking Tab 后横幅才渲染，故此处再关一次。）
+        await self._dismiss_banner()
+
+        # ── 切到 "Upcoming" 标签页并确认已激活（未来日期的预约只在此）──────────
+        # 默认停留的 "Today" 只列当天预约，在 Today 页核对必然查不到本次(未来)预约。
+        on_upcoming = False
+        for attempt in range(1, 4):
+            try:
+                upcoming_tab = self.page.locator(
+                    '[role="tab"]:has-text("Upcoming"), '
+                    '.v-tab:has-text("Upcoming"), '
+                    '.v-btn__content:has-text("Upcoming"), '
+                    'button:has-text("Upcoming"), '
+                    'span:has-text("Upcoming")'
+                ).first
+                await upcoming_tab.wait_for(state="visible", timeout=6_000)
+                await upcoming_tab.click(timeout=4_000)
+                await asyncio.sleep(1.5)
+                if await self._is_upcoming_active():
+                    on_upcoming = True
+                    log.info(f"  ✔ 已切换到 Upcoming 标签页（第{attempt}次）")
+                    break
+                log.info(f"  ⏳ Upcoming 未激活，关横幅后重试（第{attempt}次）...")
+            except Exception as e:
+                log.warning(f"  ⚠ 点击 Upcoming 失败（第{attempt}次）: {e}")
+            # 横幅可能重新弹出继续挡住标签，重试前再关一次
+            await self._dismiss_banner()
+            await asyncio.sleep(1)
 
         await self.snap(f"16_my_bookings_{label_safe}")
 
@@ -1187,8 +1276,20 @@ class NLBBooker:
                    or (time_str.replace(" ", "").lower() in body_l.replace(" ", ""))
 
         log.info(f"  📋 Bookings 列表核对: 日期命中={has_date} 时段命中={has_time} "
-                 f"(目标 {t.strftime('%d %b %Y')} {time_str})")
-        return has_date and has_time
+                 f"(目标 {t.strftime('%d %b %Y')} {time_str}) on_upcoming={on_upcoming}")
+
+        if has_date and has_time:
+            return True
+
+        # 未命中：若未能确认已切到 Upcoming（横幅没关净/渲染异常），读到的很可能是
+        # Today 列表，此时判失败会又一次误报。按「疑罪从无」返回 None（无法核实，
+        # 上层视为成功），把判断权交回已强校验过的预订流程 —— 杜绝假失败。
+        if not on_upcoming:
+            log.warning("  ⚠ 未能确认停在 Upcoming 标签，列表核实不可靠 → 视为无法核实（不判失败）")
+            return None
+
+        # 已确认在 Upcoming 仍找不到目标预约 → 判定为真失败
+        return False
 
     async def _click_confirm_dialog(self, label_safe: str):
         """处理普通确认弹窗（OK / Confirm / Yes / CONFIRM）"""
@@ -1215,7 +1316,7 @@ MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
 
 
 async def main():
-    log.info(f"=== NLB v13 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
+    log.info(f"=== NLB v15 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
     log.info(f"座位优先级 Tier0: {_TIER0 or '(未配置)'}  Tier1: {_TIER1[0]}…{_TIER1[-1]} 共{len(_TIER1)}个")
 
     async with async_playwright() as pw:
@@ -1249,8 +1350,7 @@ async def main():
                     try:
                         if attempt > 1:
                             log.warning(f"🔁 {label} 第 {attempt} 次尝试（共{MAX_RETRIES_PER_SLOT}次）...")
-                            await page.goto(BASE_URL, wait_until="load")
-                            await asyncio.sleep(2)
+                            await booker._goto()   # 回主页并先关红色横幅
                         seat, target_date = await booker.book_one_slot(label, time_str, dur_str)
                         booked.append((label, time_str, seat, target_date))
                         last_err = None
