@@ -1,11 +1,11 @@
 name: NLB Seat Auto-Booking
 
 on:
-  # 由 Cloudflare Worker Cron 在 12:00 SGT 准点通过 repository_dispatch 触发。
-  # 原因：GitHub 内置 schedule 会把定时触发拖延 3–4.5 小时，无法保证 12:30 前完成；
-  # 外部触发器准点调用本 dispatch，GitHub 收到后几秒内起跑，触发即跑、不再等待卡点。
-  repository_dispatch:
-    types: [scheduled-booking]
+  # UTC 04:00 = SGT 12:00 定时触发，触发即跑（无提前触发、无等待卡点）。
+  # 注意：GitHub 内置 schedule 是"尽力而为"，实测可能被拖延数小时，
+  #       不保证准点 12:00 —— 这是保持简单的取舍。
+  schedule:
+    - cron: "0 4 * * *"
 
   # Actions 页面手动触发（测试用，立即执行）
   workflow_dispatch:
