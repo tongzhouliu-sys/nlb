@@ -33,10 +33,17 @@
 
 | 变量名 | 是否必填 | 说明 |
 |--------|:------:|------|
-| `NLB_USERNAME` | ✅ 必填 | 你的 myLibrary ID / NRIC / Email |
-| `NLB_PASSWORD` | ✅ 必填 | 你的 NLB 密码 |
+| `NLB_USERNAME` | ✅ 必填 | 账号1：你的 myLibrary ID / NRIC / Email |
+| `NLB_PASSWORD` | ✅ 必填 | 账号1：你的 NLB 密码 |
+| `NLB_USERNAME_2` | 可选 | 账号2：第二个 NLB 账号（配了才启用双账号）|
+| `NLB_PASSWORD_2` | 可选 | 账号2：第二个 NLB 密码（需与 `NLB_USERNAME_2` 成对配置）|
 | `FEISHU_WEBHOOK_URL` | 可选 | 飞书自定义机器人 Webhook 地址；不填则跳过飞书推送 |
 | `BOOKING_DATE_OFFSET` | 可选 | 预约哪天：`0`=今天，`1`=明天（默认 `1`）|
+
+> **多账号说明**：可选配置第二个账号 `NLB_USERNAME_2` / `NLB_PASSWORD_2`（必须成对填写）。
+> 配置后，脚本会在同一次运行中**依次**为账号1、账号2各自独立登录并完整跑一遍预约流程
+> （各自独立浏览器会话，互不影响），并分别推送飞书通知。只配一个账号则行为与原来一致。
+> 两账号的调试截图分别存放在 `screenshots/account1/` 与 `screenshots/account2/`。
 
 > ⚠️ 账号密码只放在 Railway Variables，**切勿写进代码或提交到 Git**。
 > `TZ=Asia/Singapore` 已在 Dockerfile 内固定，无需在 Variables 里再设。
