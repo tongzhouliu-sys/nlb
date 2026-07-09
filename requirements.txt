@@ -1,1 +1,6 @@
+# NLB 座位预约脚本依赖
+# Playwright：浏览器自动化（唯一的第三方运行时依赖）
 playwright>=1.45
+# tzdata：保证容器内 zoneinfo.ZoneInfo("Asia/Singapore") 可用
+# （python:slim 等精简镜像默认不含系统时区库，缺失会导致日期计算报错）
+tzdata>=2024.1

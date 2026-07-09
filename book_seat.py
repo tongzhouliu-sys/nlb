@@ -114,9 +114,12 @@ BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
 # Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
+# 预约时段：11:00-12:00 / 13:00-14:00 / 15:00-16:00 / 17:00-18:00，每段 1 Hour
 TIME_SLOTS = [
-    ("10:00–11:00", "10:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
-    ("14:00–15:00", "2:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("11:00–12:00", "11:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("13:00–14:00", "1:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("15:00–16:00", "3:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("17:00–18:00", "5:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
 ]
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
@@ -1322,7 +1325,21 @@ async def main():
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            # Railway 容器内存有限，加入防崩溃 / 省内存参数避免 OOM：
+            #   --disable-dev-shm-usage：不使用 /dev/shm（容器内通常很小），改用 /tmp
+            #   --no-sandbox / --disable-setuid-sandbox：容器内无沙箱权限
+            #   --disable-gpu：无 GPU 环境
+            #   --disable-features=... / --single-process 之外的常规稳态参数
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
         )
         ctx = await browser.new_context(
             viewport={"width": 390, "height": 844},
@@ -1417,4 +1434,17 @@ async def main():
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Railway Scheduled Job：容器启动即执行预约任务，任务结束后正常退出。
+    #   - 全部时段预订流程成功（含"待核实"）→ sys.exit(0)
+    #   - 任一时段失败 / 运行异常          → sys.exit(1)
+    import sys
+    try:
+        asyncio.run(main())
+    except SystemExit as e:
+        # main() 内部对"真失败"会 raise SystemExit(1)
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        sys.exit(code)
+    except Exception as e:
+        log.error(f"❌ 运行异常，任务失败: {e}")
+        sys.exit(1)
+    sys.exit(0)

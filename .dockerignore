@@ -1,0 +1,9 @@
+# 构建镜像时排除无关 / 敏感文件，加快上传并避免污染镜像
+.git
+.github
+__pycache__
+*.pyc
+screenshots
+book_seat_v9.py
+.DS_Store
+README.md
