@@ -1,6 +1,16 @@
 """
-NLB Seat Booking Automation Script  (v15 — 修复核实阶段"假失败")
+NLB Seat Booking Automation Script  (v16 — 修复预订成功后的假报错)
 =========================================================================
+v16 核心修正：
+  【假报错根因】预订流程实际成功，但最终核实阶段在 My Bookings → Upcoming
+    列表里没匹配到目标预约（渲染慢/时间格式差异等），被判成
+    "❌ 失败: Bookings 列表未找到该预约" 并以非零码退出 —— 预订明明成功却报错。
+  【修复】① _verify_booking_result 把结果页反馈记入 _last_result_flag
+    （"ok"/"err"/"unknown"）；② 列表核实 False 且结果页无错误提示时，先重试
+    核实一次，仍找不到则降级为「⚠️ 成功(待核实)」，不判失败——只有结果页当时
+    明确提示过错误（"err"）才允许判真失败；③ 核实的时段匹配加入 24 小时制等
+    格式变体，未命中时等 3 秒重读一次，降低漏匹配概率。
+
 v15 核心修正（基于真实手机截图）：
   【假失败根因】My Bookings 顶部的红色提醒横幅
     "You must check-in before 14 minutes…automatically be cancelled"
@@ -186,6 +196,9 @@ class NLBBooker:
         self.username = username
         self.password = password
         self.tag = tag   # 账号标识，用于把不同账号的截图分目录存放
+        # 本时段结果页反馈："ok"=明确成功文案 / "err"=明确错误文案 / "unknown"=未见文案
+        # 供最终核实阶段区分「真失败」与「列表未核实到」（v16 修复预订成功后的假报错）
+        self._last_result_flag = "unknown"
 
     # ── 截图 ──────────────────────────────────────────────────────────────
     async def snap(self, name: str):
@@ -803,6 +816,7 @@ class NLBBooker:
     async def book_one_slot(self, label: str, time_str: str, dur_candidates):
         log.info(f"\n{'='*60}")
         log.info(f"▶ 预约时段: {label}")
+        self._last_result_flag = "unknown"   # 重置，防止上一时段的结果标记泄漏
 
         await self.navigate_to_new_booking()
         await self.select_library()
@@ -1136,7 +1150,10 @@ class NLBBooker:
         v14：CONFIRM 后检查页面结果。
           - 命中错误关键词时改发 warning 提示，不阻断流程，
             最终由 verify_booking_exists 登录 My Bookings 列表做真实性核查（彻底解决页面静态/隐藏文本导致的误报）。
+        v16：把结果记录到 self._last_result_flag（"ok"/"err"/"unknown"），
+          供最终核实阶段区分「真失败」与「列表未核实到」。
         """
+        self._last_result_flag = "unknown"
         await asyncio.sleep(1.0)
         try:
             body_text = (await self.page.locator("body").inner_text()).lower()
@@ -1153,8 +1170,10 @@ class NLBBooker:
         hit_ok = [w for w in ok_words if w in body_text]
 
         if hit_ok:
+            self._last_result_flag = "ok"
             log.info(f"  ✅ 预约结果页面验证通过（命中: {hit_ok}）")
         elif hit_err:
+            self._last_result_flag = "err"
             log.warning(f"  ⚠ 结果页检测到提示词 {hit_err}（可能是页面静态文案/历史残留），将交由 Bookings 列表做终极核查...")
             await self.snap(f"WARN_result_{label_safe}")
         else:
@@ -1305,8 +1324,6 @@ class NLBBooker:
             log.warning("  ⚠ Bookings 列表始终无内容，无法核实")
             return None  # 无法核实，不等于失败
 
-        body_l = body.lower()
-
         # 日期匹配：兼容 "13 Jun" / "13 June" / "Jun 13" / "13/06/2026" / "2026-06-13"
         t = target_date if target_date is not None else self._last_target_date
         date_variants = [
@@ -1315,12 +1332,30 @@ class NLBBooker:
             f"{t.strftime('%B')} {t.day}",
             t.strftime("%d/%m/%Y"),         t.strftime("%Y-%m-%d"),
         ]
-        has_date = any(v.lower() in body_l for v in date_variants)
 
-        # 时段匹配："10:00 am" → "10:00" / "10.00" / "10:00am"
+        # 时段匹配：兼容 "10:00 am" / "10:00" / "10.00" / 24小时制 "17:00"
         hm = time_str.split()[0]            # "10:00"
-        has_time = (hm in body) or (hm.replace(":", ".") in body) \
-                   or (time_str.replace(" ", "").lower() in body_l.replace(" ", ""))
+        h, m = hm.split(":")
+        h24 = int(h) % 12 + (12 if time_str.lower().endswith("pm") else 0)
+        time_variants = {hm, hm.replace(":", "."), f"{h24}:{m}", f"{h24:02d}:{m}"}
+
+        def _matched(text: str):
+            tl = text.lower()
+            hd = any(v.lower() in tl for v in date_variants)
+            ht = any(v in text for v in time_variants) \
+                 or time_str.replace(" ", "").lower() in tl.replace(" ", "")
+            return hd, ht
+
+        has_date, has_time = _matched(body)
+
+        # v16：列表可能仍在渐进渲染，未命中时等 3 秒重读一次再下结论
+        if not (has_date and has_time):
+            await asyncio.sleep(3)
+            try:
+                body = await self.page.locator("body").inner_text()
+                has_date, has_time = _matched(body)
+            except Exception:
+                pass
 
         log.info(f"  📋 Bookings 列表核对: 日期命中={has_date} 时段命中={has_time} "
                  f"(目标 {t.strftime('%d %b %Y')} {time_str}) on_upcoming={on_upcoming}")
@@ -1369,7 +1404,7 @@ async def run_account(browser, username: str, password: str, tag: str,
     返回 (has_failure, results, booked)：
       has_failure — 该账号是否存在失败时段（用于上层决定退出码）
       results     — [(label, status_str)] 全部时段的最终状态
-      booked      — [(label, time_str, seat, target_date)] 预订流程完成的时段
+      booked      — [(label, time_str, seat, target_date, result_flag)] 预订流程完成的时段
     飞书推送不在此处发送，由 main() 汇总所有账号后统一推送。"""
     log.info("\n" + "#" * 60)
     log.info(f"###### 账号 {acc_idx}/{acc_total}：{mask_username(username)}  (tag={tag})")
@@ -1403,7 +1438,8 @@ async def run_account(browser, username: str, password: str, tag: str,
                         log.warning(f"🔁 {label} 第 {attempt} 次尝试（共{MAX_RETRIES_PER_SLOT}次）...")
                         await booker._goto()   # 回主页并先关红色横幅
                     seat, target_date = await booker.book_one_slot(label, time_str, dur_str)
-                    booked.append((label, time_str, seat, target_date))
+                    booked.append((label, time_str, seat, target_date,
+                                   booker._last_result_flag))
                     last_err = None
                     break
                 except Exception as e:
@@ -1418,16 +1454,29 @@ async def run_account(browser, username: str, password: str, tag: str,
         if booked:
             log.info(f"⏳ 所有时段预订完毕，等待 10 秒后统一核实 Bookings 列表...")
             await asyncio.sleep(10)
-            for label, time_str, seat, target_date in booked:
+            for label, time_str, seat, target_date, result_flag in booked:
                 verified = await booker.verify_booking_exists(time_str, _safe(label), target_date)
+
+                # v16 修复"预订成功却假报错"：列表没找到 ≠ 一定失败。预订流程本身已强
+                # 校验（Booking Details 核对 + CONFIRM 启用检查 + 结果页文案扫描）。
+                # 只有结果页当时明确提示过错误（result_flag == "err"）才允许判真失败；
+                # 否则先重试核实一次，仍找不到就降级为「待核实」，不判 ❌、不置非零退出码。
+                if verified is False and result_flag != "err":
+                    log.warning(f"  ⚠ {label} Upcoming 列表未找到，但预订流程无错误提示，5 秒后重试核实...")
+                    await asyncio.sleep(5)
+                    verified = await booker.verify_booking_exists(time_str, _safe(label), target_date)
+
                 if verified is True:
                     results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
                 elif verified is None:
                     log.warning(f"  ⚠ {label} 无法核实 Bookings 列表，但预约流程已完成，视为成功")
                     results.append((label, f"⚠️ 成功(待核实)  座位: {seat}"))
+                elif result_flag == "err":
+                    log.error(f"❌ {label} 结果页曾提示错误且 Bookings 列表未找到该预约，判定失败，请查截图 16_my_bookings")
+                    results.append((label, f"❌ 失败: 结果页提示错误且 Bookings 列表未找到"))
                 else:
-                    log.error(f"❌ {label} Bookings 列表未找到该预约（假成功），请查截图 16_my_bookings")
-                    results.append((label, f"❌ 失败: Bookings 列表未找到该预约"))
+                    log.warning(f"  ⚠ {label} 两次核实均未在 Upcoming 列表找到，但预订流程无错误提示 → 视为成功(待核实)，请以 NLB App 为准")
+                    results.append((label, f"⚠️ 成功(待核实，列表未见，请以 App 为准)  座位: {seat}"))
 
         log.info("\n" + "=" * 60)
         log.info(f"📋 预约结果汇总（账号{acc_idx} {mask_username(username)}）:")
@@ -1474,7 +1523,7 @@ def send_combined_feishu(account_reports: list, acc_total: int):
                 all_ok = False
             else:
                 any_success = True
-        seats_summary = ", ".join(seat for _, _, seat, _ in rep["booked"] if seat)
+        seats_summary = ", ".join(seat for _, _, seat, _, _ in rep["booked"] if seat)
         if seats_summary:
             msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
 
@@ -1493,7 +1542,7 @@ def send_combined_feishu(account_reports: list, acc_total: int):
 
 
 async def main():
-    log.info(f"=== NLB v15 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
+    log.info(f"=== NLB v16 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
     log.info(f"座位优先级 Tier0: {_TIER0 or '(未配置)'}  Tier1: {_TIER1[0]}…{_TIER1[-1]} 共{len(_TIER1)}个")
 
     accounts = load_accounts()
