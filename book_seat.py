@@ -85,7 +85,11 @@ def mask_username(u: str) -> str:
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
 
 
-def send_feishu_notification(title: str, content_markdown: str, is_success: bool = True):
+def send_feishu_notification(title: str, content_markdown: str = "",
+                             is_success: bool = True, elements: list = None):
+    """发送飞书互动卡片。
+    elements 不传 → 用 content_markdown 构造单个 div（旧行为）；
+    elements 传入 → 直接作为卡片元素列表（用于表格等复杂布局）。"""
     webhook_url = FEISHU_WEBHOOK_URL.strip()
     if not webhook_url:
         log.info("ℹ 未配置 FEISHU_WEBHOOK_URL，跳过飞书推送。")
@@ -93,6 +97,13 @@ def send_feishu_notification(title: str, content_markdown: str, is_success: bool
     import json
     import urllib.request
     card_template = "green" if is_success else "red"
+    if elements is None:
+        elements = [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": content_markdown}
+            }
+        ]
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -100,12 +111,7 @@ def send_feishu_notification(title: str, content_markdown: str, is_success: bool
                 "title": {"tag": "plain_text", "content": title},
                 "template": card_template
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": content_markdown}
-                }
-            ]
+            "elements": elements
         }
     }
     try:
@@ -1493,39 +1499,95 @@ async def run_account(browser, username: str, password: str, tag: str,
         await ctx.close()
 
 
+def _feishu_table_row(cells, header: bool = False) -> dict:
+    """用 column_set 组件构造一行三列的表格行（预定时间 / 座位号 / 预定账号）。
+    自定义机器人 webhook 对 column_set 兼容性最好，lark_md 不支持 markdown 表格。"""
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "background_style": "grey" if header else "default",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{
+                    "tag": "markdown",
+                    "content": f"**{cell}**" if header else str(cell),
+                }],
+            }
+            for cell in cells
+        ],
+    }
+
+
 def send_combined_feishu(account_reports: list, acc_total: int):
-    """所有账号跑完后，把各账号结果汇总成一条飞书卡片统一推送。
+    """所有账号跑完后，汇总成一条飞书卡片统一推送：
+    上方为预约日期与图书馆，下方表格逐行列出 预定时间 / 座位号 / 预定账号。
     account_reports: [{idx, username, results, booked, error}]
       error 非 None 表示该账号运行中抛出异常（登录失败等），无逐时段结果。"""
     if not account_reports:
         return
 
     target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
-    msg_lines = [
-        f"**📅 预约日期**：{target_date}",
-        f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})",
-    ]
 
     all_ok = True
     any_success = False
+    rows = []         # (预定时间, 座位号, 预定账号)
+    fail_notes = []   # 失败/异常详情，表格下方展示
+
     for rep in account_reports:
-        msg_lines.append("")
-        msg_lines.append(
-            f"**👤 账号{rep['idx']}/{acc_total}**：{mask_username(rep['username'])}"
-        )
+        acc_label = f"账号{rep['idx']} {mask_username(rep['username'])}"
         if rep["error"] is not None:
-            msg_lines.append(f"- ❌ 运行异常: {rep['error']}")
             all_ok = False
+            rows.append(("全部时段", "❌ 运行异常", acc_label))
+            fail_notes.append(f"{acc_label} 运行异常: {str(rep['error'])[:120]}")
             continue
+        seat_by_label = {label: seat for label, _, seat, _, _ in rep["booked"]}
         for label, status in rep["results"]:
-            msg_lines.append(f"- **{label}**：{status}")
             if status.startswith("❌"):
                 all_ok = False
+                rows.append((label, "❌ 预订失败", acc_label))
+                fail_notes.append(f"{acc_label} {label}：{status}")
             else:
                 any_success = True
-        seats_summary = ", ".join(seat for _, _, seat, _, _ in rep["booked"] if seat)
-        if seats_summary:
-            msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
+                icon = "✅" if status.startswith("✅") else "⚠️"
+                seat = (seat_by_label.get(label) or "未知").split("（")[0]
+                rows.append((label, f"{icon} {seat}", acc_label))
+
+    elements = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    f"**📅 预约日期**：{target_date}\n"
+                    f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})"
+                ),
+            },
+        },
+        {"tag": "hr"},
+        _feishu_table_row(("预定时间", "座位号", "预定账号"), header=True),
+    ]
+    elements.extend(_feishu_table_row(row) for row in rows)
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": "✅ 已核实 · ⚠️ 待核实（以 NLB App 为准） · ❌ 失败",
+        }],
+    })
+    if fail_notes:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "\n".join(f"- {n}" for n in fail_notes),
+            },
+        })
 
     if all_ok:
         title = f"🪑 NLB 座位预约成功！（{len(account_reports)} 个账号汇总）"
@@ -1534,11 +1596,7 @@ def send_combined_feishu(account_reports: list, acc_total: int):
     else:
         title = f"🪑 NLB 座位预约失败（{len(account_reports)} 个账号汇总）"
 
-    send_feishu_notification(
-        title=title,
-        content_markdown="\n".join(msg_lines),
-        is_success=all_ok,
-    )
+    send_feishu_notification(title=title, is_success=all_ok, elements=elements)
 
 
 async def main():
