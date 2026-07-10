@@ -143,12 +143,22 @@ BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
 # Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
-# 预约时段：11:00-12:00 / 13:00-14:00 / 15:00-16:00 / 17:00-18:00，每段 1 Hour
+# 账号1 预约时段：11:00-12:00 / 13:00-14:00 / 15:00-16:00 / 17:00-18:00，每段 1 Hour
 TIME_SLOTS = [
     ("11:00–12:00", "11:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
     ("13:00–14:00", "1:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
     ("15:00–16:00", "3:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
     ("17:00–18:00", "5:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+]
+
+# 账号2 预约时段（配置了 NLB_USERNAME_2 时启用）：比账号1 整体提前一小时
+# 10:00-11:00 / 12:00-13:00 / 14:00-15:00 / 16:00-17:00，每段 1 Hour
+# ⚠ "12:00 pm" 为中午：_pick_dialog_radio 已用 ^...$ 精确匹配，不会误中 "2:00 pm"
+TIME_SLOTS_2 = [
+    ("10:00–11:00", "10:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("12:00–13:00", "12:00 pm", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("14:00–15:00", "2:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("16:00–17:00", "4:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
 ]
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
@@ -1353,9 +1363,14 @@ MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
 
 
 async def run_account(browser, username: str, password: str, tag: str,
-                      acc_idx: int, acc_total: int) -> bool:
+                      acc_idx: int, acc_total: int, time_slots) -> tuple:
     """为单个账号完整跑一遍预约流程（独立浏览器上下文/会话）。
-    返回 True 表示该账号存在失败时段（用于上层决定退出码）。"""
+    time_slots: 该账号使用的时段表（账号1=TIME_SLOTS，账号2=TIME_SLOTS_2 提前一小时）。
+    返回 (has_failure, results, booked)：
+      has_failure — 该账号是否存在失败时段（用于上层决定退出码）
+      results     — [(label, status_str)] 全部时段的最终状态
+      booked      — [(label, time_str, seat, target_date)] 预订流程完成的时段
+    飞书推送不在此处发送，由 main() 汇总所有账号后统一推送。"""
     log.info("\n" + "#" * 60)
     log.info(f"###### 账号 {acc_idx}/{acc_total}：{mask_username(username)}  (tag={tag})")
     log.info("#" * 60)
@@ -1379,7 +1394,7 @@ async def run_account(browser, username: str, password: str, tag: str,
         # 第一阶段：依次预订所有时段，记录座位号，不做 Bookings 列表校验
         booked = []   # [(label, time_str, seat)]
         results = []  # 最终结果（含失败项）
-        for label, time_str, dur_str in TIME_SLOTS:
+        for label, time_str, dur_str in time_slots:
             # v10：单时段失败自动重试（页面状态可能残留，先回主页再重来）
             last_err = None
             for attempt in range(1, MAX_RETRIES_PER_SLOT + 1):
@@ -1420,36 +1435,61 @@ async def run_account(browser, username: str, password: str, tag: str,
             log.info(f"  {label}  →  {status}")
         log.info("=" * 60)
 
-        # 飞书消息推送（✅ 已核实 或 ⚠️ 待核实 均视为成功推送）
-        success_count = sum(1 for _, status in results if "✅" in status or "⚠️" in status)
-        if success_count > 0:
-            target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
-            msg_lines = [
-                f"**👤 账号**：{mask_username(username)}（账号{acc_idx}/{acc_total}）",
-                f"**📅 预约日期**：{target_date}",
-                f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})",
-                "**📋 预约详情**："
-            ]
-            for label, status in results:
-                msg_lines.append(f"- **{label}**：{status}")
-            seats_summary = ", ".join(
-                seat for _, _, seat, _ in booked if seat
-            )
-            if seats_summary:
-                msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
-
-            send_feishu_notification(
-                title=f"🪑 NLB 图书馆座位预约成功！（账号{acc_idx}）",
-                content_markdown="\n".join(msg_lines),
-                is_success=True
-            )
-
-        # 该账号任一时段预订流程本身失败（❌）→ 返回 True
+        # 该账号任一时段预订流程本身失败（❌）→ has_failure=True
         # ⚠️ 待核实（验证步骤异常但预订流程完成）不触发失败
-        return any(status.startswith("❌") for _, status in results)
+        has_failure = any(status.startswith("❌") for _, status in results)
+        return has_failure, results, booked
 
     finally:
         await ctx.close()
+
+
+def send_combined_feishu(account_reports: list, acc_total: int):
+    """所有账号跑完后，把各账号结果汇总成一条飞书卡片统一推送。
+    account_reports: [{idx, username, results, booked, error}]
+      error 非 None 表示该账号运行中抛出异常（登录失败等），无逐时段结果。"""
+    if not account_reports:
+        return
+
+    target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
+    msg_lines = [
+        f"**📅 预约日期**：{target_date}",
+        f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})",
+    ]
+
+    all_ok = True
+    any_success = False
+    for rep in account_reports:
+        msg_lines.append("")
+        msg_lines.append(
+            f"**👤 账号{rep['idx']}/{acc_total}**：{mask_username(rep['username'])}"
+        )
+        if rep["error"] is not None:
+            msg_lines.append(f"- ❌ 运行异常: {rep['error']}")
+            all_ok = False
+            continue
+        for label, status in rep["results"]:
+            msg_lines.append(f"- **{label}**：{status}")
+            if status.startswith("❌"):
+                all_ok = False
+            else:
+                any_success = True
+        seats_summary = ", ".join(seat for _, _, seat, _ in rep["booked"] if seat)
+        if seats_summary:
+            msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
+
+    if all_ok:
+        title = f"🪑 NLB 座位预约成功！（{len(account_reports)} 个账号汇总）"
+    elif any_success:
+        title = f"🪑 NLB 座位预约部分成功（{len(account_reports)} 个账号汇总）"
+    else:
+        title = f"🪑 NLB 座位预约失败（{len(account_reports)} 个账号汇总）"
+
+    send_feishu_notification(
+        title=title,
+        content_markdown="\n".join(msg_lines),
+        is_success=all_ok,
+    )
 
 
 async def main():
@@ -1480,20 +1520,36 @@ async def main():
         )
 
         any_failed = False
+        account_reports = []   # 各账号结果，跑完后统一汇总发飞书
         try:
-            # 依次为每个已配置账号跑一遍（各自独立上下文/会话，互不影响）
+            # 依次为每个已配置账号跑一遍（各自独立上下文/会话，互不影响）：
+            # 账号1 用 TIME_SLOTS（11/13/15/17 点起），账号1 结束后账号2 才开始，
+            # 账号2 用 TIME_SLOTS_2（提前一小时：10/12/14/16 点起）。
             for idx, (username, password) in enumerate(accounts, 1):
                 tag = f"account{idx}"
+                slots = TIME_SLOTS if idx == 1 else TIME_SLOTS_2
+                log.info(f"账号{idx} 时段表: {', '.join(label for label, _, _ in slots)}")
                 try:
-                    acc_failed = await run_account(
-                        browser, username, password, tag, idx, len(accounts)
+                    acc_failed, results, booked = await run_account(
+                        browser, username, password, tag, idx, len(accounts), slots
                     )
                     any_failed = any_failed or acc_failed
+                    account_reports.append({
+                        "idx": idx, "username": username,
+                        "results": results, "booked": booked, "error": None,
+                    })
                 except Exception as e:
                     log.error(f"❌ 账号{idx}({mask_username(username)}) 运行异常: {e}")
                     any_failed = True
+                    account_reports.append({
+                        "idx": idx, "username": username,
+                        "results": [], "booked": [], "error": str(e),
+                    })
         finally:
             await browser.close()
+
+        # 所有账号都结束后，统一汇总发一条飞书
+        send_combined_feishu(account_reports, len(accounts))
 
         # 任一账号存在失败时段 → 非零退出码
         if any_failed:
