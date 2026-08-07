@@ -1,6 +1,16 @@
 """
-NLB Seat Booking Automation Script  (v15 — 修复核实阶段"假失败")
+NLB Seat Booking Automation Script  (v16 — 修复预订成功后的假报错)
 =========================================================================
+v16 核心修正：
+  【假报错根因】预订流程实际成功，但最终核实阶段在 My Bookings → Upcoming
+    列表里没匹配到目标预约（渲染慢/时间格式差异等），被判成
+    "❌ 失败: Bookings 列表未找到该预约" 并以非零码退出 —— 预订明明成功却报错。
+  【修复】① _verify_booking_result 把结果页反馈记入 _last_result_flag
+    （"ok"/"err"/"unknown"）；② 列表核实 False 且结果页无错误提示时，先重试
+    核实一次，仍找不到则降级为「⚠️ 成功(待核实)」，不判失败——只有结果页当时
+    明确提示过错误（"err"）才允许判真失败；③ 核实的时段匹配加入 24 小时制等
+    格式变体，未命中时等 3 秒重读一次，降低漏匹配概率。
+
 v15 核心修正（基于真实手机截图）：
   【假失败根因】My Bookings 顶部的红色提醒横幅
     "You must check-in before 14 minutes…automatically be cancelled"
@@ -41,12 +51,48 @@ from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeout
 
 # ── 配置区 ────────────────────────────────────────────────────────────────
-NLB_USERNAME = os.environ["NLB_USERNAME"]
-NLB_PASSWORD = os.environ["NLB_PASSWORD"]
+# 支持配置最多两个 NLB 账号（第二个可选）：
+#   账号1（必填，向后兼容）：NLB_USERNAME       / NLB_PASSWORD
+#   账号2（可选）：           NLB_USERNAME_2     / NLB_PASSWORD_2
+# 脚本会依次为每个已配置的账号完整跑一遍预约流程（各自独立登录/会话）。
+def load_accounts():
+    accounts = []
+    pairs = [
+        ("NLB_USERNAME",   "NLB_PASSWORD"),     # 账号1
+        ("NLB_USERNAME_2", "NLB_PASSWORD_2"),   # 账号2（可选）
+    ]
+    for u_key, p_key in pairs:
+        u = os.environ.get(u_key, "").strip()
+        p = os.environ.get(p_key, "").strip()
+        if u and p:
+            accounts.append((u, p))
+    if not accounts:
+        raise RuntimeError(
+            "未配置任何 NLB 账号：请至少设置环境变量 NLB_USERNAME 与 NLB_PASSWORD"
+        )
+    return accounts
+
+
+def mask_username(u: str) -> str:
+    """账号脱敏用于日志/通知：保留前3位与后2位，中间打码。"""
+    if not u:
+        return ""
+    if len(u) <= 5:
+        return u[0] + "***"
+    return f"{u[:3]}***{u[-2:]}"
+
+
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+# Bark 推送：填入 Bark App 的服务端 URL，格式为 https://api.day.app/{your_key}
+# 或自建 Bark 服务器地址（末尾不含 /），为空则跳过 Bark 推送。
+BARK_URL = os.environ.get("BARK_URL", "").rstrip("/")
 
 
-def send_feishu_notification(title: str, content_markdown: str, is_success: bool = True):
+def send_feishu_notification(title: str, content_markdown: str = "",
+                             is_success: bool = True, elements: list = None):
+    """发送飞书互动卡片。
+    elements 不传 → 用 content_markdown 构造单个 div（旧行为）；
+    elements 传入 → 直接作为卡片元素列表（用于表格等复杂布局）。"""
     webhook_url = FEISHU_WEBHOOK_URL.strip()
     if not webhook_url:
         log.info("ℹ 未配置 FEISHU_WEBHOOK_URL，跳过飞书推送。")
@@ -54,6 +100,13 @@ def send_feishu_notification(title: str, content_markdown: str, is_success: bool
     import json
     import urllib.request
     card_template = "green" if is_success else "red"
+    if elements is None:
+        elements = [
+            {
+                "tag": "div",
+                "text": {"tag": "lark_md", "content": content_markdown}
+            }
+        ]
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -61,12 +114,7 @@ def send_feishu_notification(title: str, content_markdown: str, is_success: bool
                 "title": {"tag": "plain_text", "content": title},
                 "template": card_template
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": content_markdown}
-                }
-            ]
+            "elements": elements
         }
     }
     try:
@@ -79,6 +127,42 @@ def send_feishu_notification(title: str, content_markdown: str, is_success: bool
             log.info("📱 飞书推送成功")
     except Exception as e:
         log.error(f"❌ 飞书推送失败: {e}")
+
+
+def send_bark_notification(title: str, body: str, is_success: bool = True):
+    """通过 Bark HTTP API 向 iOS 设备推送通知。
+    BARK_URL 格式：https://api.day.app/{key}  或自建服务器地址（末尾不含斜杠）。
+    is_success=True → 声音 "bell"；False → "alarm"。"""
+    url = BARK_URL.strip()
+    if not url:
+        log.info("ℹ 未配置 BARK_URL，跳过 Bark 推送。")
+        return
+    import json
+    import urllib.request
+    import urllib.parse
+    sound = "bell" if is_success else "alarm"
+    payload = {
+        "title": title,
+        "body": body,
+        "sound": sound,
+        "group": "NLB",
+        "icon": "https://www.nlb.gov.sg/favicon.ico",
+    }
+    try:
+        req = urllib.request.Request(
+            f"{url}/push",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("code") == 200:
+                log.info("🔔 Bark 推送成功")
+            else:
+                log.warning(f"⚠️ Bark 返回非成功: {result}")
+    except Exception as e:
+        log.error(f"❌ Bark 推送失败: {e}")
+
 
 TARGET_LIBRARY = "Punggol Library"
 TARGET_AREA    = "Study Zone, Level 3"
@@ -114,9 +198,22 @@ BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
 # Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
+# 账号1 预约时段：11:00-12:00 / 13:00-14:00 / 15:00-16:00 / 17:00-18:00，每段 1 Hour
 TIME_SLOTS = [
+    ("11:00–12:00", "11:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("13:00–14:00", "1:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("15:00–16:00", "3:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("17:00–18:00", "5:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+]
+
+# 账号2 预约时段（配置了 NLB_USERNAME_2 时启用）：比账号1 整体提前一小时
+# 10:00-11:00 / 12:00-13:00 / 14:00-15:00 / 16:00-17:00，每段 1 Hour
+# ⚠ "12:00 pm" 为中午：_pick_dialog_radio 已用 ^...$ 精确匹配，不会误中 "2:00 pm"
+TIME_SLOTS_2 = [
     ("10:00–11:00", "10:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("12:00–13:00", "12:00 pm", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
     ("14:00–15:00", "2:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
+    ("16:00–17:00", "4:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
 ]
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
@@ -139,13 +236,21 @@ def _safe(s: str) -> str:
 # ═════════════════════════════════════════════════════════════════════════
 class NLBBooker:
 
-    def __init__(self, page):
+    def __init__(self, page, username: str, password: str, tag: str = ""):
         self.page = page
+        self.username = username
+        self.password = password
+        self.tag = tag   # 账号标识，用于把不同账号的截图分目录存放
+        # 本时段结果页反馈："ok"=明确成功文案 / "err"=明确错误文案 / "unknown"=未见文案
+        # 供最终核实阶段区分「真失败」与「列表未核实到」（v16 修复预订成功后的假报错）
+        self._last_result_flag = "unknown"
 
     # ── 截图 ──────────────────────────────────────────────────────────────
     async def snap(self, name: str):
-        path = f"screenshots/{name}.png"
-        os.makedirs("screenshots", exist_ok=True)
+        # 多账号时按账号分子目录，避免第二个账号覆盖第一个账号的截图
+        subdir = f"screenshots/{self.tag}" if self.tag else "screenshots"
+        os.makedirs(subdir, exist_ok=True)
+        path = f"{subdir}/{name}.png"
         await self.page.screenshot(path=path, full_page=True)
         log.info(f"📸 {path}")
 
@@ -202,14 +307,14 @@ class NLBBooker:
                 try:
                     el = self.page.locator(u_sel).first
                     if await el.count() > 0:
-                        await el.fill(NLB_USERNAME)
+                        await el.fill(self.username)
                         log.info(f"  ✔ 用户名已填（{u_sel}）")
                         break
                 except Exception:
                     continue
 
             # 填密码
-            await self.page.fill('input[type="password"]', NLB_PASSWORD)
+            await self.page.fill('input[type="password"]', self.password)
             await self.snap("03_creds_filled")
 
             # 点提交 —— NLB 页用 "CONTINUE" 按钮（不是 Login/Submit）
@@ -756,6 +861,7 @@ class NLBBooker:
     async def book_one_slot(self, label: str, time_str: str, dur_candidates):
         log.info(f"\n{'='*60}")
         log.info(f"▶ 预约时段: {label}")
+        self._last_result_flag = "unknown"   # 重置，防止上一时段的结果标记泄漏
 
         await self.navigate_to_new_booking()
         await self.select_library()
@@ -1089,7 +1195,10 @@ class NLBBooker:
         v14：CONFIRM 后检查页面结果。
           - 命中错误关键词时改发 warning 提示，不阻断流程，
             最终由 verify_booking_exists 登录 My Bookings 列表做真实性核查（彻底解决页面静态/隐藏文本导致的误报）。
+        v16：把结果记录到 self._last_result_flag（"ok"/"err"/"unknown"），
+          供最终核实阶段区分「真失败」与「列表未核实到」。
         """
+        self._last_result_flag = "unknown"
         await asyncio.sleep(1.0)
         try:
             body_text = (await self.page.locator("body").inner_text()).lower()
@@ -1106,8 +1215,10 @@ class NLBBooker:
         hit_ok = [w for w in ok_words if w in body_text]
 
         if hit_ok:
+            self._last_result_flag = "ok"
             log.info(f"  ✅ 预约结果页面验证通过（命中: {hit_ok}）")
         elif hit_err:
+            self._last_result_flag = "err"
             log.warning(f"  ⚠ 结果页检测到提示词 {hit_err}（可能是页面静态文案/历史残留），将交由 Bookings 列表做终极核查...")
             await self.snap(f"WARN_result_{label_safe}")
         else:
@@ -1258,8 +1369,6 @@ class NLBBooker:
             log.warning("  ⚠ Bookings 列表始终无内容，无法核实")
             return None  # 无法核实，不等于失败
 
-        body_l = body.lower()
-
         # 日期匹配：兼容 "13 Jun" / "13 June" / "Jun 13" / "13/06/2026" / "2026-06-13"
         t = target_date if target_date is not None else self._last_target_date
         date_variants = [
@@ -1268,12 +1377,30 @@ class NLBBooker:
             f"{t.strftime('%B')} {t.day}",
             t.strftime("%d/%m/%Y"),         t.strftime("%Y-%m-%d"),
         ]
-        has_date = any(v.lower() in body_l for v in date_variants)
 
-        # 时段匹配："10:00 am" → "10:00" / "10.00" / "10:00am"
+        # 时段匹配：兼容 "10:00 am" / "10:00" / "10.00" / 24小时制 "17:00"
         hm = time_str.split()[0]            # "10:00"
-        has_time = (hm in body) or (hm.replace(":", ".") in body) \
-                   or (time_str.replace(" ", "").lower() in body_l.replace(" ", ""))
+        h, m = hm.split(":")
+        h24 = int(h) % 12 + (12 if time_str.lower().endswith("pm") else 0)
+        time_variants = {hm, hm.replace(":", "."), f"{h24}:{m}", f"{h24:02d}:{m}"}
+
+        def _matched(text: str):
+            tl = text.lower()
+            hd = any(v.lower() in tl for v in date_variants)
+            ht = any(v in text for v in time_variants) \
+                 or time_str.replace(" ", "").lower() in tl.replace(" ", "")
+            return hd, ht
+
+        has_date, has_time = _matched(body)
+
+        # v16：列表可能仍在渐进渲染，未命中时等 3 秒重读一次再下结论
+        if not (has_date and has_time):
+            await asyncio.sleep(3)
+            try:
+                body = await self.page.locator("body").inner_text()
+                has_date, has_time = _matched(body)
+            except Exception:
+                pass
 
         log.info(f"  📋 Bookings 列表核对: 日期命中={has_date} 时段命中={has_time} "
                  f"(目标 {t.strftime('%d %b %Y')} {time_str}) on_upcoming={on_upcoming}")
@@ -1315,106 +1442,290 @@ class NLBBooker:
 MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
 
 
+async def run_account(browser, username: str, password: str, tag: str,
+                      acc_idx: int, acc_total: int, time_slots) -> tuple:
+    """为单个账号完整跑一遍预约流程（独立浏览器上下文/会话）。
+    time_slots: 该账号使用的时段表（账号1=TIME_SLOTS，账号2=TIME_SLOTS_2 提前一小时）。
+    返回 (has_failure, results, booked)：
+      has_failure — 该账号是否存在失败时段（用于上层决定退出码）
+      results     — [(label, status_str)] 全部时段的最终状态
+      booked      — [(label, time_str, seat, target_date, result_flag)] 预订流程完成的时段
+    飞书推送不在此处发送，由 main() 汇总所有账号后统一推送。"""
+    log.info("\n" + "#" * 60)
+    log.info(f"###### 账号 {acc_idx}/{acc_total}：{mask_username(username)}  (tag={tag})")
+    log.info("#" * 60)
+
+    ctx = await browser.new_context(
+        viewport={"width": 390, "height": 844},
+        locale="en-GB",
+        timezone_id="Asia/Singapore",
+        user_agent=(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+    )
+    page = await ctx.new_page()
+    booker = NLBBooker(page, username, password, tag=tag)
+
+    try:
+        await booker.login()
+
+        # 第一阶段：依次预订所有时段，记录座位号，不做 Bookings 列表校验
+        booked = []   # [(label, time_str, seat)]
+        results = []  # 最终结果（含失败项）
+        for label, time_str, dur_str in time_slots:
+            # v10：单时段失败自动重试（页面状态可能残留，先回主页再重来）
+            last_err = None
+            for attempt in range(1, MAX_RETRIES_PER_SLOT + 1):
+                try:
+                    if attempt > 1:
+                        log.warning(f"🔁 {label} 第 {attempt} 次尝试（共{MAX_RETRIES_PER_SLOT}次）...")
+                        await booker._goto()   # 回主页并先关红色横幅
+                    seat, target_date = await booker.book_one_slot(label, time_str, dur_str)
+                    booked.append((label, time_str, seat, target_date,
+                                   booker._last_result_flag))
+                    last_err = None
+                    break
+                except Exception as e:
+                    last_err = e
+                    log.error(f"❌ {label} 第 {attempt} 次失败: {e}")
+                    await booker.snap(f"ERR_{_safe(label)}_attempt{attempt}")
+            if last_err is not None:
+                results.append((label, f"❌ 失败: {last_err}"))
+            await asyncio.sleep(3)
+
+        # 第二阶段：所有时段预订完成后，等待10秒再统一做 Bookings 列表校验
+        if booked:
+            log.info(f"⏳ 所有时段预订完毕，等待 10 秒后统一核实 Bookings 列表...")
+            await asyncio.sleep(10)
+            for label, time_str, seat, target_date, result_flag in booked:
+                verified = await booker.verify_booking_exists(time_str, _safe(label), target_date)
+
+                # v16 修复"预订成功却假报错"：列表没找到 ≠ 一定失败。预订流程本身已强
+                # 校验（Booking Details 核对 + CONFIRM 启用检查 + 结果页文案扫描）。
+                # 只有结果页当时明确提示过错误（result_flag == "err"）才允许判真失败；
+                # 否则先重试核实一次，仍找不到就降级为「待核实」，不判 ❌、不置非零退出码。
+                if verified is False and result_flag != "err":
+                    log.warning(f"  ⚠ {label} Upcoming 列表未找到，但预订流程无错误提示，5 秒后重试核实...")
+                    await asyncio.sleep(5)
+                    verified = await booker.verify_booking_exists(time_str, _safe(label), target_date)
+
+                if verified is True:
+                    results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
+                elif verified is None:
+                    log.warning(f"  ⚠ {label} 无法核实 Bookings 列表，但预约流程已完成，视为成功")
+                    results.append((label, f"⚠️ 成功(待核实)  座位: {seat}"))
+                elif result_flag == "err":
+                    log.error(f"❌ {label} 结果页曾提示错误且 Bookings 列表未找到该预约，判定失败，请查截图 16_my_bookings")
+                    results.append((label, f"❌ 失败: 结果页提示错误且 Bookings 列表未找到"))
+                else:
+                    log.warning(f"  ⚠ {label} 两次核实均未在 Upcoming 列表找到，但预订流程无错误提示 → 视为成功(待核实)，请以 NLB App 为准")
+                    results.append((label, f"⚠️ 成功(待核实，列表未见，请以 App 为准)  座位: {seat}"))
+
+        log.info("\n" + "=" * 60)
+        log.info(f"📋 预约结果汇总（账号{acc_idx} {mask_username(username)}）:")
+        for label, status in results:
+            log.info(f"  {label}  →  {status}")
+        log.info("=" * 60)
+
+        # 该账号任一时段预订流程本身失败（❌）→ has_failure=True
+        # ⚠️ 待核实（验证步骤异常但预订流程完成）不触发失败
+        has_failure = any(status.startswith("❌") for _, status in results)
+        return has_failure, results, booked
+
+    finally:
+        await ctx.close()
+
+
+def _feishu_table_row(cells, header: bool = False) -> dict:
+    """用 column_set 组件构造一行三列的表格行（预定时间 / 座位号 / 预定账号）。
+    自定义机器人 webhook 对 column_set 兼容性最好，lark_md 不支持 markdown 表格。"""
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        "background_style": "grey" if header else "default",
+        "horizontal_spacing": "default",
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": 1,
+                "vertical_align": "top",
+                "elements": [{
+                    "tag": "markdown",
+                    "content": f"**{cell}**" if header else str(cell),
+                }],
+            }
+            for cell in cells
+        ],
+    }
+
+
+def send_combined_feishu(account_reports: list, acc_total: int):
+    """所有账号跑完后，汇总成一条飞书卡片统一推送：
+    上方为预约日期与图书馆，下方表格逐行列出 预定时间 / 座位号 / 预定账号。
+    account_reports: [{idx, username, results, booked, error}]
+      error 非 None 表示该账号运行中抛出异常（登录失败等），无逐时段结果。"""
+    if not account_reports:
+        return
+
+    target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
+
+    all_ok = True
+    any_success = False
+    rows = []         # (预定时间, 座位号, 预定账号)
+    fail_notes = []   # 失败/异常详情，表格下方展示
+
+    for rep in account_reports:
+        acc_label = f"账号{rep['idx']} {mask_username(rep['username'])}"
+        if rep["error"] is not None:
+            all_ok = False
+            rows.append(("全部时段", "❌ 运行异常", acc_label))
+            fail_notes.append(f"{acc_label} 运行异常: {str(rep['error'])[:120]}")
+            continue
+        seat_by_label = {label: seat for label, _, seat, _, _ in rep["booked"]}
+        for label, status in rep["results"]:
+            if status.startswith("❌"):
+                all_ok = False
+                rows.append((label, "❌ 预订失败", acc_label))
+                fail_notes.append(f"{acc_label} {label}：{status}")
+            else:
+                any_success = True
+                icon = "✅" if status.startswith("✅") else "⚠️"
+                seat = (seat_by_label.get(label) or "未知").split("（")[0]
+                rows.append((label, f"{icon} {seat}", acc_label))
+
+    # 按预定时间（标签首段起始时间）升序排列，避免按账号处理顺序混排
+    rows.sort(key=lambda r: r[0])
+
+    elements = [
+        {
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": (
+                    f"**📅 预约日期**：{target_date}\n"
+                    f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})"
+                ),
+            },
+        },
+        {"tag": "hr"},
+        _feishu_table_row(("预定时间", "座位号", "预定账号"), header=True),
+    ]
+    elements.extend(_feishu_table_row(row) for row in rows)
+    elements.append({
+        "tag": "note",
+        "elements": [{
+            "tag": "plain_text",
+            "content": "✅ 已核实 · ⚠️ 待核实（以 NLB App 为准） · ❌ 失败",
+        }],
+    })
+    if fail_notes:
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "div",
+            "text": {
+                "tag": "lark_md",
+                "content": "\n".join(f"- {n}" for n in fail_notes),
+            },
+        })
+
+    if all_ok:
+        title = f"🪑 NLB 座位预约成功！（{len(account_reports)} 个账号汇总）"
+    elif any_success:
+        title = f"🪑 NLB 座位预约部分成功（{len(account_reports)} 个账号汇总）"
+    else:
+        title = f"🪑 NLB 座位预约失败（{len(account_reports)} 个账号汇总）"
+
+    send_feishu_notification(title=title, is_success=all_ok, elements=elements)
+
+    # ── Bark 推送（纯文本，逐行列出时段结果）────────────────────────────────
+    bark_lines = [f"📅 {target_date}  📍 {TARGET_LIBRARY}"]
+    for time_label, seat_info, acc in rows:
+        bark_lines.append(f"{time_label}  {seat_info}  {acc}")
+    if fail_notes:
+        bark_lines.append("")
+        bark_lines.extend(fail_notes)
+    send_bark_notification(title=title, body="\n".join(bark_lines), is_success=all_ok)
+
+
 async def main():
-    log.info(f"=== NLB v15 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
+    log.info(f"=== NLB v16 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
     log.info(f"座位优先级 Tier0: {_TIER0 or '(未配置)'}  Tier1: {_TIER1[0]}…{_TIER1[-1]} 共{len(_TIER1)}个")
+
+    accounts = load_accounts()
+    log.info(f"共配置 {len(accounts)} 个账号：{', '.join(mask_username(u) for u, _ in accounts)}")
 
     async with async_playwright() as pw:
         browser = await pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-setuid-sandbox"],
+            # Railway 容器内存有限，加入防崩溃 / 省内存参数避免 OOM：
+            #   --disable-dev-shm-usage：不使用 /dev/shm（容器内通常很小），改用 /tmp
+            #   --no-sandbox / --disable-setuid-sandbox：容器内无沙箱权限
+            #   --disable-gpu：无 GPU 环境
+            #   --disable-features=... / --single-process 之外的常规稳态参数
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--disable-software-rasterizer",
+                "--disable-extensions",
+                "--disable-background-networking",
+                "--disable-features=IsolateOrigins,site-per-process",
+            ],
         )
-        ctx = await browser.new_context(
-            viewport={"width": 390, "height": 844},
-            locale="en-GB",
-            timezone_id="Asia/Singapore",
-            user_agent=(
-                "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-                "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-                "Version/17.0 Mobile/15E148 Safari/604.1"
-            ),
-        )
-        page = await ctx.new_page()
-        booker = NLBBooker(page)
 
+        any_failed = False
+        account_reports = []   # 各账号结果，跑完后统一汇总发飞书
         try:
-            await booker.login()
-
-            # 第一阶段：依次预订所有时段，记录座位号，不做 Bookings 列表校验
-            booked = []   # [(label, time_str, seat)]
-            results = []  # 最终结果（含失败项）
-            for label, time_str, dur_str in TIME_SLOTS:
-                # v10：单时段失败自动重试（页面状态可能残留，先回主页再重来）
-                last_err = None
-                for attempt in range(1, MAX_RETRIES_PER_SLOT + 1):
-                    try:
-                        if attempt > 1:
-                            log.warning(f"🔁 {label} 第 {attempt} 次尝试（共{MAX_RETRIES_PER_SLOT}次）...")
-                            await booker._goto()   # 回主页并先关红色横幅
-                        seat, target_date = await booker.book_one_slot(label, time_str, dur_str)
-                        booked.append((label, time_str, seat, target_date))
-                        last_err = None
-                        break
-                    except Exception as e:
-                        last_err = e
-                        log.error(f"❌ {label} 第 {attempt} 次失败: {e}")
-                        await booker.snap(f"ERR_{_safe(label)}_attempt{attempt}")
-                if last_err is not None:
-                    results.append((label, f"❌ 失败: {last_err}"))
-                await asyncio.sleep(3)
-
-            # 第二阶段：所有时段预订完成后，等待10秒再统一做 Bookings 列表校验
-            if booked:
-                log.info(f"⏳ 所有时段预订完毕，等待 10 秒后统一核实 Bookings 列表...")
-                await asyncio.sleep(10)
-                for label, time_str, seat, target_date in booked:
-                    verified = await booker.verify_booking_exists(time_str, _safe(label), target_date)
-                    if verified is True:
-                        results.append((label, f"✅ 成功(已核实)  座位: {seat}"))
-                    elif verified is None:
-                        log.warning(f"  ⚠ {label} 无法核实 Bookings 列表，但预约流程已完成，视为成功")
-                        results.append((label, f"⚠️ 成功(待核实)  座位: {seat}"))
-                    else:
-                        log.error(f"❌ {label} Bookings 列表未找到该预约（假成功），请查截图 16_my_bookings")
-                        results.append((label, f"❌ 失败: Bookings 列表未找到该预约"))
-
-            log.info("\n" + "=" * 60)
-            log.info("📋 预约结果汇总:")
-            for label, status in results:
-                log.info(f"  {label}  →  {status}")
-            log.info("=" * 60)
-
-            # 飞书消息推送（✅ 已核实 或 ⚠️ 待核实 均视为成功推送）
-            success_count = sum(1 for _, status in results if "✅" in status or "⚠️" in status)
-            if success_count > 0:
-                target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
-                msg_lines = [
-                    f"**📅 预约日期**：{target_date}",
-                    f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})",
-                    "**📋 预约详情**："
-                ]
-                for label, status in results:
-                    msg_lines.append(f"- **{label}**：{status}")
-                seats_summary = ", ".join(
-                    seat for _, _, seat, _ in booked if seat
-                )
-                if seats_summary:
-                    msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
-                
-                send_feishu_notification(
-                    title="🪑 NLB 图书馆座位预约成功！",
-                    content_markdown="\n".join(msg_lines),
-                    is_success=True
-                )
-
-            # 任一时段预订流程本身失败（❌）→ 非零退出码，让 GitHub Actions 标红
-            # ⚠️ 待核实（验证步骤异常但预订流程完成）不触发失败
-            if any(status.startswith("❌") for _, status in results):
-                raise SystemExit(1)
-
+            # 依次为每个已配置账号跑一遍（各自独立上下文/会话，互不影响）：
+            # 账号1 用 TIME_SLOTS（11/13/15/17 点起），账号1 结束后账号2 才开始，
+            # 账号2 用 TIME_SLOTS_2（提前一小时：10/12/14/16 点起）。
+            for idx, (username, password) in enumerate(accounts, 1):
+                tag = f"account{idx}"
+                slots = TIME_SLOTS if idx == 1 else TIME_SLOTS_2
+                log.info(f"账号{idx} 时段表: {', '.join(label for label, _, _ in slots)}")
+                try:
+                    acc_failed, results, booked = await run_account(
+                        browser, username, password, tag, idx, len(accounts), slots
+                    )
+                    any_failed = any_failed or acc_failed
+                    account_reports.append({
+                        "idx": idx, "username": username,
+                        "results": results, "booked": booked, "error": None,
+                    })
+                except Exception as e:
+                    log.error(f"❌ 账号{idx}({mask_username(username)}) 运行异常: {e}")
+                    any_failed = True
+                    account_reports.append({
+                        "idx": idx, "username": username,
+                        "results": [], "booked": [], "error": str(e),
+                    })
         finally:
             await browser.close()
 
+        # 所有账号都结束后，统一汇总发一条飞书 + Bark
+        send_combined_feishu(account_reports, len(accounts))
+
+        # 任一账号存在失败时段 → 非零退出码
+        if any_failed:
+            raise SystemExit(1)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Railway Scheduled Job：容器启动即执行预约任务，任务结束后正常退出。
+    #   - 全部时段预订流程成功（含"待核实"）→ sys.exit(0)
+    #   - 任一时段失败 / 运行异常          → sys.exit(1)
+    import sys
+    try:
+        asyncio.run(main())
+    except SystemExit as e:
+        # main() 内部对"真失败"会 raise SystemExit(1)
+        code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
+        sys.exit(code)
+    except Exception as e:
+        log.error(f"❌ 运行异常，任务失败: {e}")
+        sys.exit(1)
+    sys.exit(0)
