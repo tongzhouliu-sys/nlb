@@ -83,6 +83,9 @@ def mask_username(u: str) -> str:
 
 
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+# Bark 推送：填入 Bark App 的服务端 URL，格式为 https://api.day.app/{your_key}
+# 或自建 Bark 服务器地址（末尾不含 /），为空则跳过 Bark 推送。
+BARK_URL = os.environ.get("BARK_URL", "").rstrip("/")
 
 
 def send_feishu_notification(title: str, content_markdown: str = "",
@@ -124,6 +127,42 @@ def send_feishu_notification(title: str, content_markdown: str = "",
             log.info("📱 飞书推送成功")
     except Exception as e:
         log.error(f"❌ 飞书推送失败: {e}")
+
+
+def send_bark_notification(title: str, body: str, is_success: bool = True):
+    """通过 Bark HTTP API 向 iOS 设备推送通知。
+    BARK_URL 格式：https://api.day.app/{key}  或自建服务器地址（末尾不含斜杠）。
+    is_success=True → 声音 "bell"；False → "alarm"。"""
+    url = BARK_URL.strip()
+    if not url:
+        log.info("ℹ 未配置 BARK_URL，跳过 Bark 推送。")
+        return
+    import json
+    import urllib.request
+    import urllib.parse
+    sound = "bell" if is_success else "alarm"
+    payload = {
+        "title": title,
+        "body": body,
+        "sound": sound,
+        "group": "NLB",
+        "icon": "https://www.nlb.gov.sg/favicon.ico",
+    }
+    try:
+        req = urllib.request.Request(
+            f"{url}/push",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            result = json.loads(resp.read().decode())
+            if result.get("code") == 200:
+                log.info("🔔 Bark 推送成功")
+            else:
+                log.warning(f"⚠️ Bark 返回非成功: {result}")
+    except Exception as e:
+        log.error(f"❌ Bark 推送失败: {e}")
+
 
 TARGET_LIBRARY = "Punggol Library"
 TARGET_AREA    = "Study Zone, Level 3"
@@ -1601,6 +1640,15 @@ def send_combined_feishu(account_reports: list, acc_total: int):
 
     send_feishu_notification(title=title, is_success=all_ok, elements=elements)
 
+    # ── Bark 推送（纯文本，逐行列出时段结果）────────────────────────────────
+    bark_lines = [f"📅 {target_date}  📍 {TARGET_LIBRARY}"]
+    for time_label, seat_info, acc in rows:
+        bark_lines.append(f"{time_label}  {seat_info}  {acc}")
+    if fail_notes:
+        bark_lines.append("")
+        bark_lines.extend(fail_notes)
+    send_bark_notification(title=title, body="\n".join(bark_lines), is_success=all_ok)
+
 
 async def main():
     log.info(f"=== NLB v16 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
@@ -1658,7 +1706,7 @@ async def main():
         finally:
             await browser.close()
 
-        # 所有账号都结束后，统一汇总发一条飞书
+        # 所有账号都结束后，统一汇总发一条飞书 + Bark
         send_combined_feishu(account_reports, len(accounts))
 
         # 任一账号存在失败时段 → 非零退出码
