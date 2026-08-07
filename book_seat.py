@@ -1557,6 +1557,9 @@ def send_combined_feishu(account_reports: list, acc_total: int):
                 seat = (seat_by_label.get(label) or "未知").split("（")[0]
                 rows.append((label, f"{icon} {seat}", acc_label))
 
+    # 按预定时间（标签首段起始时间）升序排列，避免按账号处理顺序混排
+    rows.sort(key=lambda r: r[0])
+
     elements = [
         {
             "tag": "div",
