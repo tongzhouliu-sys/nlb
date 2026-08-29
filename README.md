@@ -64,6 +64,63 @@ python book_seat.py
 
 运行后截图保存在 `screenshots/` 目录，方便查看每步骤结果。
 
+### 只补推飞书与 Telegram（不会订座）
+
+```bash
+./.venv/bin/python run_local.py --resend
+```
+
+补推会重新登录两个账号，只读取 `My Bookings → Upcoming` 中的最终预约结果，
+取得具体 `S数字` 座位号后再推送；不会进入订座页面，也不会使用
+`Any available seat` 作为推送结果。
+
+本机 `config.env` 同时配置以下两项后，同一份核验结果会并行推送到 Telegram：
+
+```dotenv
+TELEGRAM_BOT_TOKEN=BotFather提供的Token
+TELEGRAM_CHAT_ID=接收消息的Chat ID
+```
+
+### Telegram 菜单补推
+
+结果消息底部带有 `🔄 再推一次任务结果` 按钮，也可以从机器人菜单选择
+`/resend`。两种入口都会调用现有的只读补推流程，不会再次订座。
+
+结果消息底部同时提供 `🗓 重新预定`，机器人菜单中对应 `/rebook`。该操作会
+重新运行完整订座程序，因此必须在 Telegram 中再次点击确认按钮才会执行；取消
+不会进入订座流程。订座、重新预定和只读补推共用进程锁，不会并发运行。
+
+首次注册菜单：
+
+```bash
+./.venv/bin/python telegram_menu_bot.py --setup-menu
+```
+
+前台测试监听器：
+
+```bash
+./.venv/bin/python telegram_menu_bot.py
+```
+
+检查菜单、Webhook 和机器人状态：
+
+```bash
+./.venv/bin/python telegram_menu_bot.py --check
+```
+
+默认只允许 `TELEGRAM_CHAT_ID` 对应的私人用户执行菜单命令。如需将接收群与
+操作人分开，可在 `config.env` 增加：
+
+```dotenv
+TELEGRAM_ALLOWED_USER_ID=允许操作菜单的Telegram数字用户ID
+```
+
+本机常驻监听使用：
+
+```text
+launchd/com.davizhuliang.nlb-telegram-menu.plist
+```
+
 ---
 
 ## 修改配置

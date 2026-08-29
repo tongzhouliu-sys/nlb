@@ -34,7 +34,10 @@ v10 继承：Tier0(S74,S86,S1,S17) → Tier1(S74-S86,S1-S17)；normalize_seat_id
 
 import os
 import asyncio
+import json
 import logging
+import re
+import sys
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -44,16 +47,86 @@ from playwright.async_api import async_playwright, TimeoutError as PlaywrightTim
 NLB_USERNAME = os.environ["NLB_USERNAME"]
 NLB_PASSWORD = os.environ["NLB_PASSWORD"]
 FEISHU_WEBHOOK_URL = os.environ.get("FEISHU_WEBHOOK_URL", "")
+ACCOUNT_LABEL = os.environ.get("NLB_ACCOUNT_LABEL", "默认账号")
+SCREENSHOTS_DIR = os.environ.get("SCREENSHOTS_DIR", "screenshots")
+RESULTS_FILE = os.environ.get("NLB_RESULTS_FILE", "")
+DEFER_FEISHU_NOTIFICATION = os.environ.get("NLB_DEFER_FEISHU", "0") == "1"
 
 
-def send_feishu_notification(title: str, content_markdown: str, is_success: bool = True):
+def _feishu_table_row(
+    time_label: str,
+    seat: str,
+    status: str,
+    *,
+    header: bool = False,
+    shaded: bool = False,
+):
+    weight = "**" if header else ""
+    cells = ((time_label, 5), (seat, 2), (status, 3))
+    return {
+        "tag": "column_set",
+        "flex_mode": "none",
+        **({"background_style": "grey"} if header or shaded else {}),
+        "columns": [
+            {
+                "tag": "column",
+                "width": "weighted",
+                "weight": cell_weight,
+                "horizontal_align": "left",
+                "elements": [
+                    {
+                        "tag": "div",
+                        "text": {
+                            "tag": "lark_md",
+                            "content": f"{weight}{value}{weight}",
+                        },
+                    }
+                ],
+            }
+            for value, cell_weight in cells
+        ],
+    }
+
+
+def send_feishu_notification(
+    title: str,
+    content_markdown: str,
+    is_success: bool = True,
+    table_rows: list[dict] | None = None,
+):
     webhook_url = FEISHU_WEBHOOK_URL.strip()
     if not webhook_url:
         log.info("ℹ 未配置 FEISHU_WEBHOOK_URL，跳过飞书推送。")
         return
-    import json
     import urllib.request
     card_template = "green" if is_success else "red"
+    safe_content = re.sub(
+        r"(?i)any\s+available\s+seat",
+        "最终座位号未核实",
+        content_markdown,
+    )
+    elements = [
+        {
+            "tag": "div",
+            "text": {"tag": "lark_md", "content": safe_content},
+        }
+    ]
+    if table_rows:
+        elements.extend(
+            [
+                {"tag": "hr"},
+                _feishu_table_row("时段", "座位", "状态", header=True),
+                *[
+                    _feishu_table_row(
+                        str(row.get("label", "未知时段")),
+                        str(row.get("seat") or "—"),
+                        "✅ 成功" if row.get("seat") else "❌ 未核实",
+                        shaded=index % 2 == 1,
+                    )
+                    for index, row in enumerate(table_rows)
+                ],
+            ]
+        )
     payload = {
         "msg_type": "interactive",
         "card": {
@@ -61,22 +134,29 @@ def send_feishu_notification(title: str, content_markdown: str, is_success: bool
                 "title": {"tag": "plain_text", "content": title},
                 "template": card_template
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "text": {"tag": "lark_md", "content": content_markdown}
-                }
-            ]
+            "elements": elements,
         }
     }
     try:
         req = urllib.request.Request(
             webhook_url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"}
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=utf-8"}
         )
         with urllib.request.urlopen(req, timeout=10) as resp:
-            log.info("📱 飞书推送成功")
+            response_body = resp.read().decode("utf-8", errors="replace")
+        response_data = json.loads(response_body)
+        response_code = response_data.get(
+            "StatusCode", response_data.get("code")
+        )
+        if str(response_code) != "0":
+            response_message = response_data.get(
+                "StatusMessage", response_data.get("msg", "未知错误")
+            )
+            raise RuntimeError(
+                f"飞书拒绝消息：code={response_code}, message={response_message}"
+            )
+        log.info("📱 飞书推送成功（飞书回执 code=0）")
     except Exception as e:
         log.error(f"❌ 飞书推送失败: {e}")
 
@@ -114,10 +194,27 @@ BOOKING_DATE_OFFSET = int(os.environ.get("BOOKING_DATE_OFFSET", "1"))
 
 # (显示标签, Time弹窗选项文字, Duration弹窗选项文字)
 # Duration 候选列表：NLB 页面可能显示多种格式，按顺序尝试
-TIME_SLOTS = [
-    ("10:00–11:00", "10:00 am", ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
-    ("14:00–15:00", "2:00 pm",  ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]),
-]
+_DURATION_CANDIDATES = ["1:00", "1 hour", "60 mins", "1 hr", "1 hr 0 min"]
+
+
+def build_time_slots():
+    """Build one-hour booking slots from the per-account local schedule."""
+    raw_start_times = os.environ.get("NLB_START_TIMES", "10:00 am|2:00 pm")
+    slots = []
+    for raw_start in raw_start_times.split("|"):
+        time_str = raw_start.strip()
+        if not time_str:
+            continue
+        start = datetime.strptime(time_str, "%I:%M %p")
+        end = start + timedelta(hours=1)
+        label = f"{start.strftime('%H:%M')}–{end.strftime('%H:%M')}"
+        slots.append((label, time_str, list(_DURATION_CANDIDATES)))
+    if not slots:
+        raise ValueError("NLB_START_TIMES 未配置任何有效时段")
+    return slots
+
+
+TIME_SLOTS = build_time_slots()
 
 BASE_URL  = "https://www.nlb.gov.sg/seatbooking"
 LOGIN_URL = f"{BASE_URL}/common/login"
@@ -136,6 +233,69 @@ def _safe(s: str) -> str:
     return s.replace(":", "").replace("–", "_").replace(" ", "")
 
 
+def _booking_date_section(body: str, target_date: datetime) -> str:
+    """Return only the target date block from the Upcoming bookings page."""
+    markers = [
+        f"{target_date.day} {target_date.strftime('%b')} {target_date.year}",
+        f"{target_date.day:02d} {target_date.strftime('%b')} {target_date.year}",
+        f"{target_date.day} {target_date.strftime('%B')} {target_date.year}",
+        f"{target_date.strftime('%b')} {target_date.day}, {target_date.year}",
+        f"{target_date.strftime('%B')} {target_date.day}, {target_date.year}",
+    ]
+    body_lower = body.lower()
+    starts = [body_lower.find(marker.lower()) for marker in markers]
+    starts = [index for index in starts if index >= 0]
+    if not starts:
+        return ""
+
+    marker_start = min(starts)
+    section_start = body.rfind("\n", 0, marker_start) + 1
+    next_date = re.search(
+        r"(?im)^\s*(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?"
+        r"\s+\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}\s*$",
+        body[marker_start + 1 :],
+    )
+    if next_date:
+        section_end = marker_start + 1 + next_date.start()
+        return body[section_start:section_end]
+    return body[section_start:]
+
+
+def _booking_start_match(text: str, time_str: str):
+    """Find a booking card whose displayed time range starts at time_str."""
+    start = datetime.strptime(time_str, "%I:%M %p")
+    hour = str(int(start.strftime("%I")))
+    minute = start.strftime("%M")
+    am_pm = start.strftime("%p").lower()
+    return re.search(
+        rf"(?im)^\s*0?{re.escape(hour)}[:.]({re.escape(minute)})\s*{am_pm}\b",
+        text,
+    )
+
+
+def extract_final_booking(
+    body: str,
+    target_date: datetime,
+    time_str: str,
+) -> tuple[bool, str]:
+    """Return (booking found, concrete S-number) for one Upcoming card."""
+    section = _booking_date_section(body, target_date)
+    time_match = _booking_start_match(section, time_str) if section else None
+    if not time_match:
+        return False, ""
+
+    area_lower = TARGET_AREA.lower()
+    card_start = section.lower().rfind(area_lower, 0, time_match.start())
+    if card_start < 0:
+        card_start = time_match.start()
+    next_card = section.lower().find(area_lower, time_match.end())
+    card_end = next_card if next_card >= 0 else min(len(section), time_match.start() + 320)
+    card_text = section[card_start:card_end]
+    seat_match = re.search(r"(?i)(?<![A-Z0-9])S\s*-?\s*(\d{1,3})(?!\d)", card_text)
+    seat = f"S{seat_match.group(1)}" if seat_match else ""
+    return True, seat
+
+
 # ═════════════════════════════════════════════════════════════════════════
 class NLBBooker:
 
@@ -144,8 +304,8 @@ class NLBBooker:
 
     # ── 截图 ──────────────────────────────────────────────────────────────
     async def snap(self, name: str):
-        path = f"screenshots/{name}.png"
-        os.makedirs("screenshots", exist_ok=True)
+        path = os.path.join(SCREENSHOTS_DIR, f"{name}.png")
+        os.makedirs(SCREENSHOTS_DIR, exist_ok=True)
         await self.page.screenshot(path=path, full_page=True)
         log.info(f"📸 {path}")
 
@@ -1180,6 +1340,70 @@ class NLBBooker:
                 continue
         return False
 
+    async def read_upcoming_bookings(self, snapshot_name: str) -> tuple[str, bool]:
+        """Open My Bookings > Upcoming and return its visible text.
+
+        This is read-only: it never enters New Booking and never clicks BOOK/CONFIRM.
+        """
+        log.info("▶ 最终结果核验：打开 My Bookings → Upcoming...")
+        try:
+            await self._goto()
+            tab = self.page.locator(
+                '.v-btn__content:has-text("Booking"), '
+                'span:has-text("Booking"), button:has-text("Booking")'
+            ).first
+            await tab.wait_for(state="visible", timeout=10_000)
+            await tab.click()
+            try:
+                await self.page.wait_for_load_state("load", timeout=15_000)
+            except PlaywrightTimeout:
+                pass
+            await asyncio.sleep(2)
+        except Exception as exc:
+            log.warning(f"  ⚠ 打开 My Bookings 失败: {exc}")
+            await self.snap(f"ERR_open_bookings_{snapshot_name}")
+            return "", False
+
+        await self._dismiss_banner()
+        on_upcoming = False
+        for attempt in range(1, 4):
+            try:
+                upcoming_tab = self.page.locator(
+                    '[role="tab"]:has-text("Upcoming"), '
+                    '.v-tab:has-text("Upcoming"), '
+                    '.v-btn__content:has-text("Upcoming"), '
+                    'button:has-text("Upcoming"), '
+                    'span:has-text("Upcoming")'
+                ).first
+                await upcoming_tab.wait_for(state="visible", timeout=6_000)
+                await upcoming_tab.click(timeout=4_000)
+                await asyncio.sleep(1.5)
+                if await self._is_upcoming_active():
+                    on_upcoming = True
+                    log.info(f"  ✔ 已切换到 Upcoming 标签页（第{attempt}次）")
+                    break
+            except Exception as exc:
+                log.warning(f"  ⚠ 点击 Upcoming 失败（第{attempt}次）: {exc}")
+            await self._dismiss_banner()
+            await asyncio.sleep(1)
+
+        await self.snap(snapshot_name)
+        body = ""
+        for attempt in range(1, 4):
+            try:
+                body = await self.page.locator("body").inner_text()
+            except Exception:
+                body = ""
+            if body.strip():
+                break
+            log.info(f"  ⏳ Upcoming 内容为空，等待渲染（第{attempt}次）...")
+            await asyncio.sleep(3)
+
+        if not body.strip():
+            log.warning("  ⚠ Upcoming 列表始终无内容")
+            return "", on_upcoming
+        return body, on_upcoming
+
     # ── 终极校验：去 Bookings 列表核实预约真实存在（v11）──────────────────
     async def verify_booking_exists(self, time_str: str, label_safe: str, target_date: datetime = None):
         """
@@ -1315,8 +1539,162 @@ class NLBBooker:
 MAX_RETRIES_PER_SLOT = 2   # 每个时段最多尝试次数（含首次）
 
 
+def write_result_report(results, booked, fatal_error: str = ""):
+    """Write a machine-readable report for the two-account local runner."""
+    if not RESULTS_FILE:
+        return
+
+    booked_by_label = {
+        label: {"time_str": time_str, "seat": seat, "date": target_date.strftime("%Y-%m-%d")}
+        for label, time_str, seat, target_date in booked
+    }
+    start_by_label = {label: time_str for label, time_str, _ in TIME_SLOTS}
+    fallback_date = (
+        datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
+    ).strftime("%Y-%m-%d")
+    rows = []
+    for label, status in results:
+        booked_row = booked_by_label.get(label, {})
+        rows.append(
+            {
+                "account": ACCOUNT_LABEL,
+                "label": label,
+                "start_time": booked_row.get("time_str", start_by_label.get(label, "")),
+                "date": booked_row.get("date", fallback_date),
+                "seat": booked_row.get("seat", ""),
+                "status": status,
+            }
+        )
+
+    report = {
+        "account": ACCOUNT_LABEL,
+        "date": fallback_date,
+        "fatal_error": fatal_error,
+        "results": rows,
+    }
+    parent = os.path.dirname(RESULTS_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(RESULTS_FILE, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, ensure_ascii=False, indent=2)
+
+
+def write_final_verification_report(rows: list[dict], fatal_error: str = ""):
+    """Write the read-only, re-login verification result for the notifier."""
+    if not RESULTS_FILE:
+        raise RuntimeError("最终核验缺少 NLB_RESULTS_FILE")
+    target_date = (
+        datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
+    ).strftime("%Y-%m-%d")
+    report = {
+        "account": ACCOUNT_LABEL,
+        "date": target_date,
+        "fatal_error": fatal_error,
+        "verification_source": "My Bookings > Upcoming（重新登录读取）",
+        "results": rows,
+    }
+    parent = os.path.dirname(RESULTS_FILE)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(RESULTS_FILE, "w", encoding="utf-8") as report_file:
+        json.dump(report, report_file, ensure_ascii=False, indent=2)
+
+
+async def collect_final_verification(
+    browser,
+    target_date: datetime,
+    snapshot_name: str = "17_final_upcoming",
+) -> list[dict]:
+    """Use a fresh browser context to re-login and collect concrete final seats."""
+    ctx = await browser.new_context(
+        viewport={"width": 390, "height": 844},
+        locale="en-GB",
+        timezone_id="Asia/Singapore",
+        user_agent=(
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+            "Version/17.0 Mobile/15E148 Safari/604.1"
+        ),
+    )
+    try:
+        page = await ctx.new_page()
+        booker = NLBBooker(page)
+        await booker.login()
+        body, on_upcoming = await booker.read_upcoming_bookings(snapshot_name)
+        if not body or not on_upcoming:
+            raise RuntimeError("未能可靠读取 Upcoming 预约列表")
+
+        rows = []
+        for label, time_str, _ in TIME_SLOTS:
+            found, seat = extract_final_booking(body, target_date, time_str)
+            if found and seat:
+                status = "✅ 已重新登录核实"
+                log.info(f"  ✅ {label} 最终座位: {seat}")
+            elif found:
+                status = "❌ 找到预约但未读取到最终座位号"
+                log.error(f"  ❌ {label} 找到预约，但没有具体 S 座位号")
+            else:
+                status = "❌ Upcoming 未找到该时段预约"
+                log.error(f"  ❌ {label} Upcoming 未找到预约")
+            rows.append(
+                {
+                    "account": ACCOUNT_LABEL,
+                    "label": label,
+                    "start_time": time_str,
+                    "date": target_date.strftime("%Y-%m-%d"),
+                    "seat": seat,
+                    "status": status,
+                }
+            )
+        return rows
+    finally:
+        await ctx.close()
+
+
+async def verify_only_main() -> int:
+    """Re-login and read final seats without entering the booking flow."""
+    target_date = datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
+    rows: list[dict] = []
+    fatal_error = ""
+    log.info(f"=== NLB 最终结果只读核验 | {datetime.now(SGT):%Y-%m-%d %H:%M:%S} SGT ===")
+    log.info(f"核验账号: {ACCOUNT_LABEL}；目标日期: {target_date:%Y-%m-%d}")
+
+    try:
+        async with async_playwright() as pw:
+            browser = await pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox"],
+            )
+            try:
+                rows = await collect_final_verification(
+                    browser,
+                    target_date,
+                )
+            finally:
+                await browser.close()
+    except Exception as exc:
+        fatal_error = f"{type(exc).__name__}: {exc}"
+        log.error(f"❌ 最终结果核验失败: {fatal_error}")
+        rows = [
+            {
+                "account": ACCOUNT_LABEL,
+                "label": label,
+                "start_time": time_str,
+                "date": target_date.strftime("%Y-%m-%d"),
+                "seat": "",
+                "status": f"❌ 最终核验失败: {exc}",
+            }
+            for label, time_str, _ in TIME_SLOTS
+        ]
+
+    write_final_verification_report(rows, fatal_error=fatal_error)
+    return 0 if rows and all(row.get("seat") for row in rows) else 1
+
+
 async def main():
     log.info(f"=== NLB v15 | {datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT ===")
+    log.info(f"预约账号: {ACCOUNT_LABEL}")
+    log.info(f"预约时段: {[label for label, _, _ in TIME_SLOTS]}")
     log.info(f"座位优先级 Tier0: {_TIER0 or '(未配置)'}  Tier1: {_TIER1[0]}…{_TIER1[-1]} 共{len(_TIER1)}个")
 
     async with async_playwright() as pw:
@@ -1336,13 +1714,16 @@ async def main():
         )
         page = await ctx.new_page()
         booker = NLBBooker(page)
+        summary_sent = False
+        report_written = False
+        final_verification_failed = False
+        booked = []   # [(label, time_str, seat, target_date)]
+        results = []  # [(label, status)]
 
         try:
             await booker.login()
 
             # 第一阶段：依次预订所有时段，记录座位号，不做 Bookings 列表校验
-            booked = []   # [(label, time_str, seat)]
-            results = []  # 最终结果（含失败项）
             for label, time_str, dur_str in TIME_SLOTS:
                 # v10：单时段失败自动重试（页面状态可能残留，先回主页再重来）
                 last_err = None
@@ -1384,37 +1765,77 @@ async def main():
                 log.info(f"  {label}  →  {status}")
             log.info("=" * 60)
 
-            # 飞书消息推送（✅ 已核实 或 ⚠️ 待核实 均视为成功推送）
-            success_count = sum(1 for _, status in results if "✅" in status or "⚠️" in status)
-            if success_count > 0:
-                target_date = (datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)).strftime("%Y-%m-%d")
+            write_result_report(results, booked)
+            report_written = True
+
+            # 单账号/GitHub Actions 模式直接推送；本机双账号模式延后合并推送。
+            if results and not DEFER_FEISHU_NOTIFICATION:
+                target_date = datetime.now(SGT) + timedelta(days=BOOKING_DATE_OFFSET)
+                log.info("▶ 飞书推送前使用新会话重新登录核验最终座位...")
+                final_rows = await collect_final_verification(
+                    browser,
+                    target_date,
+                    "17_final_upcoming_before_feishu",
+                )
+                final_verification_failed = any(
+                    row.get("status", "").startswith("❌") or not row.get("seat")
+                    for row in final_rows
+                )
+                success_count = sum(1 for row in final_rows if row.get("seat"))
                 msg_lines = [
-                    f"**📅 预约日期**：{target_date}",
-                    f"**📍 图书馆**：{TARGET_LIBRARY} ({TARGET_AREA})",
-                    "**📋 预约详情**："
+                    f"📅 **{target_date:%Y-%m-%d}**　·　📍 {TARGET_LIBRARY} · L3 Study Zone",
+                    "**🪑 最终座位**",
                 ]
-                for label, status in results:
-                    msg_lines.append(f"- **{label}**：{status}")
-                seats_summary = ", ".join(
-                    seat for _, _, seat, _ in booked if seat
-                )
-                if seats_summary:
-                    msg_lines.append(f"**🪑 座位号汇总**：{seats_summary}")
                 
+                if final_verification_failed and success_count:
+                    title = "⚠️ NLB 座位预约部分失败"
+                elif final_verification_failed:
+                    title = "❌ NLB 座位预约失败"
+                else:
+                    title = "🪑 NLB 座位预约成功"
+
                 send_feishu_notification(
-                    title="🪑 NLB 图书馆座位预约成功！",
+                    title=title,
                     content_markdown="\n".join(msg_lines),
-                    is_success=True
+                    is_success=not final_verification_failed,
+                    table_rows=final_rows,
                 )
+                summary_sent = True
+            elif DEFER_FEISHU_NOTIFICATION:
+                summary_sent = True
 
             # 任一时段预订流程本身失败（❌）→ 非零退出码，让 GitHub Actions 标红
             # ⚠️ 待核实（验证步骤异常但预订流程完成）不触发失败
-            if any(status.startswith("❌") for _, status in results):
+            if final_verification_failed or any(
+                status.startswith("❌") for _, status in results
+            ):
                 raise SystemExit(1)
 
+        except BaseException as e:
+            if not report_written:
+                write_result_report(
+                    results,
+                    booked,
+                    fatal_error=f"{type(e).__name__}: {e}",
+                )
+            # 登录或页面初始化阶段失败时，单账号模式仍发送失败通知。
+            if not summary_sent and not DEFER_FEISHU_NOTIFICATION:
+                send_feishu_notification(
+                    title="❌ NLB 座位预约异常",
+                    content_markdown=(
+                        f"⏰ **{datetime.now(SGT).strftime('%Y-%m-%d %H:%M:%S')} SGT**\n"
+                        f"❌ {type(e).__name__}: {e}"
+                    ),
+                    is_success=False,
+                )
+            raise
         finally:
             await browser.close()
 
 
 if __name__ == "__main__":
+    if sys.argv[1:] == ["--verify-only"]:
+        raise SystemExit(asyncio.run(verify_only_main()))
+    if sys.argv[1:]:
+        raise SystemExit(f"不支持的参数：{' '.join(sys.argv[1:])}")
     asyncio.run(main())

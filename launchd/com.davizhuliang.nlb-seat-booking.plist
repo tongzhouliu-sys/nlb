@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.davizhuliang.nlb-seat-booking</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mac/Documents/GitHub/nlb/.venv/bin/python</string>
+        <string>/Users/mac/Documents/GitHub/nlb/run_local.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mac/Documents/GitHub/nlb</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NLB_LOCAL_CONFIG</key>
+        <string>/Users/mac/Library/Application Support/NLB Seat Booking/config.env</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>TZ</key>
+        <string>Asia/Singapore</string>
+    </dict>
+
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>12</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>StandardOutPath</key>
+    <string>/Users/mac/Library/Logs/nlb-seat-booking.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mac/Library/Logs/nlb-seat-booking.error.log</string>
+</dict>
+</plist>

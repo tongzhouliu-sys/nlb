@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.davizhuliang.nlb-telegram-menu</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mac/Documents/GitHub/nlb/.venv/bin/python</string>
+        <string>/Users/mac/Documents/GitHub/nlb/telegram_menu_bot.py</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/mac/Documents/GitHub/nlb</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NLB_LOCAL_CONFIG</key>
+        <string>/Users/mac/Library/Application Support/NLB Seat Booking/config.env</string>
+        <key>PYTHONUNBUFFERED</key>
+        <string>1</string>
+        <key>TZ</key>
+        <string>Asia/Singapore</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+    <key>ProcessType</key>
+    <string>Background</string>
+
+    <key>StandardOutPath</key>
+    <string>/Users/mac/Library/Logs/nlb-telegram-menu.log</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/mac/Library/Logs/nlb-telegram-menu.error.log</string>
+</dict>
+</plist>
